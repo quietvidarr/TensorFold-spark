@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +12,8 @@ import torch
 from . import format as fmt
 
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
+# 17-128 rows in 32-row passes that decode each weight tile once (linear2_kernel; same bits); 0 = 16-row passes
+MT2 = os.environ.get("TF_EXL3_LINEAR_MT2", "1") != "0"
 
 
 @lru_cache(maxsize=1)
@@ -18,7 +21,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -181,7 +184,7 @@ class Exl3Linear:
         ext = _ext()
         ext.rot_in(x, self.suh, xh)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, MT2)
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:

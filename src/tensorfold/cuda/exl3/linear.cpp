@@ -4,7 +4,7 @@
 void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&);
 void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
-                      int64_t, int64_t, int64_t, int64_t);
+                      int64_t, int64_t, int64_t, int64_t, bool);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
@@ -34,7 +34,7 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
 // y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
-            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK) {
+            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, bool mt2) {
     check(xh, at::kHalf, "xh");
     check_io(y, "y");
     check(svh, at::kHalf, "svh");
@@ -54,7 +54,7 @@ void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t
         TORCH_CHECK(Z->numel() >= SK * M * N, "Z too small");
     }
     c10::cuda::CUDAGuard guard(xh.device());
-    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK);
+    exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, mt2);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -69,6 +69,8 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_in", &rot_in);
-    m.def("linear", &linear);
+    m.def("linear", &linear, py::arg("xh"), py::arg("T"), py::arg("stride_k"), py::arg("stride_nb"), py::arg("svh"),
+          py::arg("bias"), py::arg("y"), py::arg("Z"), py::arg("counters"), py::arg("K2"), py::arg("cb"), py::arg("SK"),
+          py::arg("WK"), py::arg("mt2") = true);
     m.def("unpack", &unpack);
 }

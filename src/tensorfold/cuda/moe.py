@@ -48,6 +48,8 @@ def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None)
     bm = _tile(m)
     if bm == 16:
         be, bk, stages = 32, 256, 4
+    elif bm == 32:                               # 17-32 rows (several streams): more, shorter programs; same bits
+        be, bk, stages = 16, 128, 4
     else:
         be, bk, stages = 64, 64, 3               # Smaller K tiles keep prefill within shared-memory limits.
     grid = (triton.cdiv(m, bm), triton.cdiv(ne, be))

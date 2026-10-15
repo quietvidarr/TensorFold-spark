@@ -187,7 +187,8 @@ def prompt_kernel_fits(ex: Exl3RoutedExperts) -> bool:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, prompt: bool = False, summed: bool = False) -> torch.Tensor:
+           group: bool = True, prompt: bool = False, summed: bool = False,
+           out16: torch.Tensor | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
 
     ``prompt``: a prompt window through the prompt kernel (each decoded weight tile against every member of its
@@ -219,7 +220,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    # ``out16``: the sum also as bf16 rows (torch's rounding), written by the same launch
+    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, out16)
     return out
 
 

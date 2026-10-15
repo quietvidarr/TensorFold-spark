@@ -24,7 +24,7 @@ void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64
 void exl3x_down_sum_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                          int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
-                             at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+                             at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void*);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -204,7 +204,7 @@ void down_sum(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh
 
 void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor y,
                   const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots,
-                  int64_t E) {
+                  int64_t E, const c10::optional<at::Tensor>& out16) {
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_d, at::kHalf, "svh_d");
@@ -213,7 +213,9 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     check(out, at::kFloat, "out");
     TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
     c10::cuda::CUDAGuard guard(Z.device());
-    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E);
+    if (out16) TORCH_CHECK(out16->is_cuda() && out16->scalar_type() == at::kBFloat16 && out16->is_contiguous() &&
+                           out16->numel() >= rows * D, "out16: bf16 [rows, D]");
+    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E, out16 ? out16->data_ptr() : nullptr);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -227,6 +229,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
     m.def("combine", &combine);
-    m.def("down_combine", &down_combine);
+    m.def("down_combine", &down_combine, py::arg("Z"), py::arg("pick"), py::arg("svh_d"), py::arg("y"), py::arg("wts"),
+          py::arg("out"), py::arg("rows"), py::arg("P"), py::arg("D"), py::arg("SK"), py::arg("slots"), py::arg("E"),
+          py::arg("out16") = py::none());
     m.def("down_sum", &down_sum);
 }

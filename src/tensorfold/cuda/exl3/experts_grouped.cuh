@@ -1,6 +1,7 @@
 // Grouped EXL3 expert GEMV (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): rows stay independent, K ranges fixed by shape, warps summed in order.
 #pragma once
 
+#include <algorithm>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <ATen/ATen.h>
@@ -181,24 +182,74 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
+// warp_tiles with the trellis words staged by cp.async (16 B, no cache hints) into this warp's ring of S k steps in
+// shared memory: lane words read from the ring are the words warp_tiles loads from global memory, so the decode and
+// the mma sequence (and the bits) are the same; in-flight bytes no longer take registers.
+template <int CB, int K2, int NT, int S>
+__device__ __forceinline__ void warp_tiles_async(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt,
+                                                 int nt0, const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                                 float (&acc)[NT][2][4], uint32_t* ring) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW, STEP = NT * TW, CH = STEP / 4;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* gp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    auto issue = [&](int s) {
+        if (s < nkt) {
+            const uint32_t* src = gp + (size_t)s * kstride;
+            uint32_t* dst = ring + (s % S) * STEP;
+            for (int c = lane; c < CH; c += 32) {
+                const unsigned sa = (unsigned)__cvta_generic_to_shared(dst + 4 * c);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(src + 4 * c));
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+#pragma unroll
+    for (int s = 0; s < S - 1; ++s) issue(s);
+    for (int it = 0; it < nkt; ++it) {
+        issue(it + S - 1);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(S - 1));
+        __syncwarp();
+        const uint32_t* st = ring + (it % S) * STEP;
+        const int k = (kt0 + it) * 16;
+        uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                         load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int l = 0; l < LW; ++l) {
+                if constexpr ((TW % 32) == 0)
+                    w[l] = st[i * TW + l * 32 + lane];
+                else
+                    w[l] = (l * 32 + lane < TW) ? st[i * TW + l * 32 + lane] : 0u;
+            }
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(w, map, lane, b0, b1);
+            mma16816(acc[i][0], a, b0);
+            mma16816(acc[i][1], a, b1);
+        }
+        __syncwarp();                                        // the slot is refilled S - 1 steps later
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
 // The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
 __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
 }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
-template <int CB, int NT, int W, int PF, int LO, int HI>
-__global__ void __launch_bounds__(W * 32) grouped_kernel(
+template <int CB, int NT, int W, int PF, int LO, int HI, int AS>
+__device__ __forceinline__ void grouped_program(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
-    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
-    if (u >= ucount[0]) return;
+    const int* __restrict__ uids, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int u, int by, int bz) {
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = bz % MT;
+    const int split = (bz / MT) % SK;
+    const int mat = bz / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -208,6 +259,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int KT = K >> 4, NTILES = N >> 4;
 
     __shared__ int rows_sh[16];
+    __syncthreads();                                      // a persistent block's previous program read rows_sh / red
     if (threadIdx.x < 16) {
         const int m = mtile * 16 + threadIdx.x;
         const int code = m < maxm ? members[u * maxm + m] : -1;
@@ -221,7 +273,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = by * NT;
 
     float acc[NT][2][4];
 #pragma unroll
@@ -235,7 +287,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
+            if constexpr (AS > 0) {                                                                             \
+                extern __shared__ __align__(16) unsigned char gsm[];                                            \
+                warp_tiles_async<CB, K2_, NT, AS>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane,   \
+                                                  acc, reinterpret_cast<uint32_t*>(gsm) + warp * AS * NT * 4 * HI); \
+            } else {                                                                                            \
+                warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);\
+            }                                                                                                   \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -259,8 +317,16 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             __trap();
     }
 
-    // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
+    // warps' partial sums through shared memory, added in warp order (the async ring's memory: every warp is done)
+    float (*red)[16][NT * 16];
+    if constexpr (AS > 0) {
+        extern __shared__ __align__(16) unsigned char gsm[];
+        __syncthreads();
+        red = reinterpret_cast<float (*)[16][NT * 16]>(gsm);
+    } else {
+        __shared__ float red_s[W][16][NT * 16];
+        red = red_s;
+    }
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -282,6 +348,47 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
         Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
     }
 }
+
+// The program as a real call (the persistent loop then keeps the program's own register allocation).
+template <int CB, int NT, int W, int PF, int LO, int HI, int AS>
+__device__ __noinline__ void grouped_program_call(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int u, int by, int bz) {
+    grouped_program<CB, NT, W, PF, LO, HI, AS>(X0, X1, TP0, TP1, K2_0, K2_1, uids, members, Z, K, N, P, SK, maxm,
+                                               slots, u, by, bz);
+}
+
+// One program a block, as launched: (u, n block, split x member tile) = blockIdx; programs past ucount exit.
+// The persistent form runs the same programs from a fixed grid: block b runs programs b, b + gridDim.x, ... of the
+// ucount * NY * NZ live ones (launch order: u fastest); only empty programs are skipped. *_min4: at most 128 registers.
+#define TF_GROUPED_KERNELS(NAME, BOUNDS)                                                                         \
+template <int CB, int NT, int W, int PF, int LO, int HI, int AS>                                               \
+__global__ void BOUNDS NAME(                                                                                   \
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,                 \
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,               \
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,             \
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {                                 \
+    if ((int)blockIdx.x >= ucount[0]) return;                                                                  \
+    grouped_program<CB, NT, W, PF, LO, HI, AS>(X0, X1, TP0, TP1, K2_0, K2_1, uids, members, Z, K, N, P, SK, maxm, \
+                                               slots, blockIdx.x, blockIdx.y, blockIdx.z);                     \
+}                                                                                                              \
+template <int CB, int NT, int W, int PF, int LO, int HI, int AS>                                               \
+__global__ void BOUNDS NAME##_persist(                                                                         \
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,                 \
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,               \
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,             \
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int NY, int NZ) {                 \
+    const int uc = ucount[0], total = uc * NY * NZ;                                                            \
+    for (int item = blockIdx.x; item < total; item += gridDim.x)                                               \
+        grouped_program_call<CB, NT, W, PF, LO, HI, AS>(X0, X1, TP0, TP1, K2_0, K2_1, uids, members, Z, K, N, P, \
+                                                        SK, maxm, slots, item % uc, (item / uc) % NY,            \
+                                                        item / uc / NY);                                         \
+}
+TF_GROUPED_KERNELS(grouped_kernel, __launch_bounds__(W * 32))
+TF_GROUPED_KERNELS(grouped_kernel_min4, __launch_bounds__(W * 32, 4))
+#undef TF_GROUPED_KERNELS
 
 // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
 template <int CB, int K2>
@@ -324,20 +431,50 @@ struct GroupedArgs {
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
-#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots)
+    const int pf = a.pf & 0xff;
+    const bool persist = (a.pf >> 8) & 1, minb4 = (a.pf >> 9) & 1;   // launch variants: same programs, same bits
+    const bool async3 = (a.pf >> 10) & 1;                                // trellis words through a 3-step cp.async ring
+    const int NY = a.N / (16 * a.nt), NZ = a.mats * a.SK * MT;
+    dim3 grid((unsigned)a.nexp_max, (unsigned)NY, (unsigned)NZ);
+#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_, MB_, AS_)                                                             \
+    const int smem = AS_ ? std::max(W_ * 16 * NT_ * 16 * 4, W_ * AS_ * NT_ * 4 * HI_ * 4) : 0;                   \
+    if (persist) {                                                                                             \
+        auto k = MB_ == 4 ? grouped_kernel_min4_persist<CB, NT_, W_, PF_, LO_, HI_, AS_>                         \
+                          : grouped_kernel_persist<CB, NT_, W_, PF_, LO_, HI_, AS_>;                            \
+        if (smem > 48 * 1024) cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);      \
+        static int resident = 0;                                                                               \
+        if (!resident) {                                                                                       \
+            int per = 0, sms = 0, dev = 0;                                                                     \
+            cudaGetDevice(&dev);                                                                               \
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);                                 \
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k, W_ * 32, smem);                            \
+            resident = std::max(1, per) * sms;                                                                 \
+        }                                                                                                      \
+        const int most = a.nexp_max * NY * NZ;                                                                 \
+        k<<<(unsigned)std::min(resident, most), W_ * 32, smem, stream>>>(                                      \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,     \
+            a.maxm, a.slots, NY, NZ);                                                                          \
+    } else {                                                                                                   \
+        auto k = MB_ == 4 ? grouped_kernel_min4<CB, NT_, W_, PF_, LO_, HI_, AS_>                                 \
+                          : grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, AS_>;                                    \
+        if (smem > 48 * 1024) cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);      \
+        k<<<grid, W_ * 32, smem, stream>>>(                                                                    \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,     \
+            a.maxm, a.slots);                                                                                  \
+    }
+#define TF_MB(NT_, W_, PF_, LO_, HI_) {                                                                        \
+        if (async3) { if (minb4) { TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 4, 3) } else { TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 1, 3) } } \
+        else { if (minb4) { TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 4, 0) } else { TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 1, 0) } } }
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
-    if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
-    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
-    else TF_LAUNCH(NT_, W_, PF_, 2, 16);
-    if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1) }
-    else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
-    else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
+    if (a.lo == 8 && a.hi == 8) TF_MB(NT_, W_, PF_, 8, 8)                                                       \
+    else if (a.lo >= 2 && a.hi <= 10) TF_MB(NT_, W_, PF_, 2, 10)                                                \
+    else TF_MB(NT_, W_, PF_, 2, 16)
+    if (a.nt == 8 && a.warps == 4 && pf == 1) { TF_RANGES(8, 4, 1) }
+    else if (a.nt == 8 && a.warps == 4 && pf == 2) { TF_RANGES(8, 4, 2) }
+    else if (a.nt == 4 && a.warps == 4 && pf == 2) { TF_RANGES(4, 4, 2) }
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
 #undef TF_RANGES
+#undef TF_MB
 #undef TF_LAUNCH
 }
 
