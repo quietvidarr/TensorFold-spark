@@ -11,6 +11,9 @@ import torch
 
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows, uniform
 
+import os
+
+COALESCE = os.environ.get("TF_COALESCE", "1") != "0"      # lab: one read-back a sampling call (0: today's two)
 MASS = 2.0 ** 40        # a token's share of the mass in fixed point: shard sums are exact, so ranks agree bit for bit
 NUCLEUS = 1024          # candidates a rank reads for a top_k-off draw; a row they don't cover reads whole shards
 
@@ -26,7 +29,12 @@ def sample_rows(logits: torch.Tensor, positions: Sequence[int], sampling: Sampli
         return nucleus_rows(logits, positions, sampling)
     width = logits.shape[1]
     count = min(width, int(sampling.top_k) + MARGIN) if sampling.top_k else width
-    if count < width:
+    if count < width and COALESCE and width < 1 << 24:     # one read-back: ids ride as exact float32 integers
+        values, ids = torch.topk(logits.float(), count, dim=-1, sorted=False)
+        got = torch.cat([values, ids.float()], dim=1).cpu().numpy()
+        values_np = np.ascontiguousarray(got[:, :count])
+        ids_np = got[:, count:].astype(np.int64)
+    elif count < width:
         values, ids = torch.topk(logits.float(), count, dim=-1, sorted=False)
         values_np = values.cpu().numpy()
         ids_np = ids.cpu().numpy().astype(np.int64, copy=False)
@@ -60,9 +68,12 @@ def sample_streams(logits: torch.Tensor, starts: Sequence[int], positions: Seque
             launched.append((count, members, ids, values))
         else:
             launched.append((count, members, None, rows.float()))
+    if COALESCE and width < 1 << 24 and len(launched) > 0 and all(c < width for c, *_ in launched):
+        launched = _coalesced(launched)
     for count, members, ids, values in launched:
-        ids_np = ids.cpu().numpy().astype(np.int64, copy=False) if ids is not None else None
-        values_np = values.cpu().numpy() if values is not None else None
+        ids_np = ids if isinstance(ids, np.ndarray) else (
+            ids.cpu().numpy().astype(np.int64, copy=False) if ids is not None else None)
+        values_np = values if isinstance(values, np.ndarray) else (values.cpu().numpy() if values is not None else None)
         row = 0
         for s in members:
             n = starts[s + 1] - starts[s]
@@ -74,6 +85,28 @@ def sample_streams(logits: torch.Tensor, starts: Sequence[int], positions: Seque
                                                                                    v.shape)
                 out[s] = choose_rows(v, i, positions[s], samplings[s])
             row += n
+    return out
+
+
+def _coalesced(launched: list) -> list:
+    """Every group's ids (and values) read back in one copy: ids as exact float32 integers, values as they are."""
+
+    parts = []
+    for count, members, ids, values in launched:
+        parts.append(ids.float().reshape(-1))
+        if values is not None:
+            parts.append(values.reshape(-1))
+    got = torch.cat(parts).cpu().numpy()
+    out, at = [], 0
+    for count, members, ids, values in launched:
+        n = ids.numel()
+        ids_np = got[at:at + n].astype(np.int64).reshape(ids.shape)
+        at += n
+        values_np = None
+        if values is not None:
+            values_np = got[at:at + values.numel()].reshape(values.shape)
+            at += values.numel()
+        out.append((count, members, ids_np, values_np))
     return out
 
 

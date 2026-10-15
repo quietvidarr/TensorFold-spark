@@ -21,7 +21,7 @@ from tensorfold.engine.grammar import GrammarError
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
 from . import attn_multi, disk_points, gdn_multi, image_rows, prefixes, vision_prefix
-from .forward import commit, compute, compute_mixed, converges, stage
+from .forward import commit, compute, compute_mixed, converges, stage, warm_ple
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
 from .multi_solo import Alone, solo
@@ -475,20 +475,34 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             if st.mtp_drafted:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
+        for s, _, keep in todo:
+            warm_ple(self.w, s.st, [keep[-1]])
         windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
         segs = mtp_stage(self.w, self.mbuf, windows)
         logits = self._mtp(segs)
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
+        copies = {}                                      # copied continuations, verified if the first draft agrees
+        for s, _, keep in todo:
+            if getattr(s, "copies", None) is not None:
+                got = s.copies.propose(s.context + list(keep), 15)[:room[s.sid]]
+                if got:
+                    copies[s.sid] = got
+        keep_of = {s.sid: keep[-1] for s, _, keep in todo}
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
+                if j == 0 and s.sid in copies and copies[s.sid][0] == d:
+                    s.drafts = copies[s.sid]
+                    warm_ple(self.w, s.st, [keep_of[s.sid]] + s.drafts)   # read-ahead (kernel 0007) for copied drafts too
+                    continue
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
+                warm_ple(self.w, s.st, [keep_of[s.sid]] + s.drafts)
                 if not low and j + 1 < room[s.sid]:
                     nxt.append((s, row, d))
             if not nxt:

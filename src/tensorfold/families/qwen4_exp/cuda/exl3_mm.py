@@ -17,6 +17,67 @@ from tensorfold.cuda.exl3.linear import Exl3Linear
 from .exl3_pack import MOE_WINDOW
 
 ROWS = 128               # most rows one call of the EXL3 linear or a split fp16 matmul takes
+# the fp16 matrices' decode calls on hc_gemv.cu (the same bits as _f16_mm, W read once for up to 64 rows)
+HC_GEMV = __import__("os").environ.get("TF_FLASH_HC_GEMV", "0") == "1"
+
+
+@__import__("functools").lru_cache(maxsize=1)
+def _hc_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_flash_hc_gemv_v2", sources=[str(here / "hc_gemv.cu")],
+                extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+
+
+HC12 = __import__("os").environ.get("TF_FLASH_HC12", "0") == "1"
+HC12_CFG = int(__import__("os").environ.get("TF_FLASH_HC12_CFG", "0"))   # launch shape: 0 4 warps x 4 stages, 1 2x4, 2 4x3, 3 2x3
+HC12_ROWS = 24          # measured: faster than _f16_mm up to here (wider windows read the fp16 copy, the same bits)
+
+
+@torch.no_grad()
+def hc_pack(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp16 [N, K] -> hc_gemv12's lossless store: (packed uint8, exception offsets int32, exception entries int32).
+
+    Stage block (16-row tile, 64-k chunk) = 128 groups of 8 values (row-major: row, 8-value chunk), 3 words a group,
+    value i in bits 12 i: sign | fp16 exponent field (0..15) | mantissa bits 9..3. Exceptions (low mantissa bits set or
+    exponent field >= 16) per block in (row, k) order: (row * 64 + k) << 16 | fp16 bits."""
+
+    n, k = w.shape
+    tiles, kc = -(-n // 16), k // 64
+    b = torch.zeros((tiles * 16, k), dtype=torch.int32, device=w.device)
+    b[:n] = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    exc = ((b & 7) != 0) | (((b >> 10) & 0x1F) >= 16)
+    code = (((b >> 15) & 1) << 11) | (((b >> 10) & 0xF) << 7) | ((b >> 3) & 0x7F)
+    code = torch.where(exc, torch.zeros_like(code), code).to(torch.int64)
+    c = code.view(tiles, 16, kc, 8, 8).permute(0, 2, 1, 3, 4).reshape(-1, 8)      # [blocks * 128 groups, 8]
+    lo = c[:, 0] | (c[:, 1] << 12) | (c[:, 2] << 24) | (c[:, 3] << 36) | (c[:, 4] << 48) | ((c[:, 5] & 0xF) << 60)
+    hi = (c[:, 5] >> 4) | (c[:, 6] << 8) | (c[:, 7] << 20)
+    m32 = 0xFFFFFFFF
+    words = torch.stack([lo & m32, (lo >> 32) & m32, hi & m32], 1).reshape(-1)
+    words = torch.where(words >= 2 ** 31, words - 2 ** 32, words).to(torch.int32)
+    e = exc.view(tiles, 16, kc, 64).permute(0, 2, 1, 3)                            # [tiles, kc, row, k]
+    at = e.nonzero()                                                               # block-major, then (row, k)
+    vals = b.view(tiles, 16, kc, 64).permute(0, 2, 1, 3)[e]
+    blk = at[:, 0] * kc + at[:, 1]
+    ent = ((at[:, 2] * 64 + at[:, 3]) << 16) | vals.to(torch.int64)
+    ent = torch.where(ent >= 2 ** 31, ent - 2 ** 32, ent).to(torch.int32)
+    counts = torch.bincount(blk, minlength=tiles * kc)
+    eoff = torch.zeros((tiles * kc + 1,), dtype=torch.int32, device=w.device)
+    eoff[1:] = torch.cumsum(counts, 0).to(torch.int32)
+    return words.view(torch.uint8).contiguous(), eoff, ent.contiguous()
+
+
+def hc_gemv_fits(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, sk: int, f32: bool) -> bool:
+    k = w.shape[1]
+    if x.dtype != torch.bfloat16 or x.stride(1) != 1 or x.stride(0) % 2 or x.data_ptr() % 4 or k % sk \
+            or (k // sk) % 64 or w.data_ptr() % 16 or k % 8:
+        return False
+    if f32:
+        return out.dtype == torch.float32 and out.is_contiguous()
+    return out.dtype == torch.bfloat16 and out.stride(-1) == 1 and sk == 1 and w.shape[0] % 2 == 0
 
 
 class Scratch:
@@ -136,6 +197,14 @@ class F16:
         m = x.shape[0]
         if x.stride(1) != 1 or x.shape[1] != self.k:
             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
+        p12 = getattr(self, "p12", None)
+        if p12 is not None and m <= HC12_ROWS and hc_gemv_fits(x, self.w, out, self.sk, f32) \
+                and self.k // self.sk // 64 <= 63:
+            _hc_ext().hc_gemv12(x, *p12, self.n, out, self.sk, f32, HC12_CFG)
+            return
+        if HC_GEMV and m <= ROWS and hc_gemv_fits(x, self.w, out, self.sk, f32):
+            _hc_ext().hc_gemv(x, self.w, out, self.sk, f32)
+            return
         grid = (triton.cdiv(m, 16), triton.cdiv(self.n, 64), self.sk)
         _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
                       K=self.k, KS=self.k // self.sk, BM=16, BN=64, BK=64, F32=f32, num_warps=4, num_stages=3)

@@ -15,7 +15,7 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import CONFIDENCE, DEPTH
-from .forward import Cut, commit, cut_snapshot, forward
+from .forward import Cut, commit, cut_snapshot, forward, warm_ple
 from . import image_rows
 from .state import CAND, Buffers, State
 from .mtp import mtp_forward
@@ -263,10 +263,12 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
 
 
 def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
-          sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+          sampling: Sampling | None, confidence: float = 0.0, copy: list[int] | None = None) -> list[int]:
     """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft."""
 
     st = e.st
+    first = int(next_tokens[-1])                  # the next window's row 0 (the token after the kept path)
+    warm_ple(e.w, st, [first])
     logits = absorb(e, streams, next_tokens)
     drafts: list[int] = []
     for j in range(count):
@@ -278,7 +280,11 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
                 break
         else:
             d = e.sample(logits[:1], [position + j], sampling, draft=True)[0]
+        if j == 0 and copy and copy[0] == d:            # the head agrees with a copied continuation: verify that
+            warm_ple(e.w, st, [first] + list(copy))     # read-ahead (kernel 0007) for copied drafts too
+            return list(copy)
         drafts.append(d)
+        warm_ple(e.w, st, [first] + drafts)
         if low:
             break
         if j + 1 < count:

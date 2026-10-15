@@ -541,6 +541,49 @@ def stage_ahead() -> bool:
     return os.environ.get(STAGE_AHEAD, "1").strip().lower() not in ("0", "off", "false", "no")
 
 
+NGRAM_WARM = os.environ.get("TF_FLASH_NGRAM_WARM", "0") == "1"      # measured slower (lab): off
+
+
+def warm_ple(w: Weights, st: State, tokens: Sequence[int]) -> None:
+    """Start reading the n-gram rows the next ``stage`` will read for the last of ``tokens`` (the next window's rows
+    so far, after ``st``'s committed history): their SSD reads overlap drafting. ``stage`` still reads every row itself."""
+
+    if not NGRAM_WARM or st.ple_history is None:
+        return
+    toks = np.asarray(tokens, dtype=np.int64)
+    for layer in w.layers:
+        p = layer.ple
+        if p is not None and hasattr(p.table, "warm"):
+            p.table.warm(p.ngram.ids(st.ple_history, toks)[-1:])
+
+
+def _gather_grouped(lookups) -> list:
+    """Each lookup's table rows, every stream's rows of one table in one gather (one batch of native reads instead of
+    one a stream); the same rows in the same order, split back per lookup."""
+
+    if not NGRAM_GROUPED or not all(hasattr(p.table, "_pread") for p, _, _ in lookups):   # EXL3 tables only
+        return [p.table.gather(ids) for p, ids, _ in lookups]
+    out: list = [None] * len(lookups)
+    by: dict[int, list[int]] = {}
+    for i, (p, _, _) in enumerate(lookups):
+        by.setdefault(id(p.table), []).append(i)
+    for members in by.values():
+        table = lookups[members[0]][0].table
+        if len(members) == 1:
+            out[members[0]] = table.gather(lookups[members[0]][1])
+            continue
+        flat = [np.asarray(lookups[i][1], dtype=np.int64).reshape(-1) for i in members]
+        got = table.gather(np.concatenate(flat))
+        at = 0
+        for i, f in zip(members, flat):
+            out[i] = got[at:at + f.size]
+            at += f.size
+    return out
+
+
+NGRAM_GROUPED = os.environ.get("TF_FLASH_NGRAM_GROUPED", "1") != "0"
+
+
 def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
     """Host work before a forward (token ids, n-gram rows into static buffers); returns each stream's segment."""
 
@@ -563,7 +606,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
                 st.ple_last = (st.ple_history, toks)
                 lookups.append((p, ids, a0 * (ids.size // len(toks))))
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if stage_ahead() else None
+    ahead = _gather_grouped(lookups) if stage_ahead() else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)

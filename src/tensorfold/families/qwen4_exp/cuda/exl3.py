@@ -149,6 +149,12 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         if inject:
             rows.append(pk.get(name + ".block_inject_weight.weight"))
         down, up = f16(sc, rows, device), f16(sc, [pk.get(name + ".input_mix_weight_up.weight")], device)
+        from .exl3_mm import HC12, hc_pack
+
+        if HC12:                                      # decode calls read the lossless 12-bit store (hc_gemv12)
+            for m in (down, up):
+                if m.k % 64 == 0:
+                    m.p12 = hc_pack(m.w)
         return HC(down, up, centred(name + ".hc_norm.weight"), inject, down, up)
 
     def moe(name: str) -> MoEW:

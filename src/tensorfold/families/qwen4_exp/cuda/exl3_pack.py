@@ -167,6 +167,7 @@ class NgramTable:
             except (OSError, AttributeError):
                 pass
         self._pool = None
+        self._warmer, self._warming = None, 0
         weakref.finalize(self, _close_reads, self._fds.tolist())
         self.fidx = np.array(fidx, dtype=np.int64)
         self.offsets = np.array(offsets, dtype=np.int64)
@@ -241,6 +242,29 @@ class NgramTable:
                 _preadv_all((reads, view))
         return out[inverse].view(np.int16)
 
+    def warm(self, ids: np.ndarray) -> None:
+        """Read rows ``ids`` on a background thread (into the page cache, the bytes dropped), so a later ``gather`` of
+        them copies from memory; at most a few batches queued (a stale guess only costs its reads)."""
+
+        if self.mode != "pread" or self._warming >= 4:
+            return
+        if self._warmer is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._warmer = ThreadPoolExecutor(1, thread_name_prefix="exl3-ngram-warm")
+        flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if not flat.size or np.any(flat < 0) or np.any(flat >= self.rows):
+            return
+        self._warming += 1
+
+        def run():
+            try:
+                self._pread(flat)
+            finally:
+                self._warming -= 1
+
+        self._warmer.submit(run)
+
     def lock(self) -> bool:
         if os.name == "nt":
             from ..host_table import HostTable
@@ -282,7 +306,7 @@ def _native_reader():
             try:
                 from tensorfold.cuda.build import load
 
-                got = load(name="tensorfold_ngram_read_v1", sources=[str(Path(__file__).with_name("ngram_read.cpp"))],
+                got = load(name="tensorfold_ngram_read_v2", sources=[str(Path(__file__).with_name("ngram_read.cpp"))],
                            extra_cflags=["-O2"], verbose=False)
             except Exception as error:                # noqa: BLE001  the Python loop reads the same bytes
                 print(f"[tensorfold] n-gram native reader unavailable ({error}); reading in Python", flush=True)

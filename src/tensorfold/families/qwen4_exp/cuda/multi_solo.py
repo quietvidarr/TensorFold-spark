@@ -148,7 +148,9 @@ class Alone:
         s.drafts = []
         room = min(self.depth, s.count - len(s.out) - len(path))
         if not last and room > 0:
+            copy = (s.copies.propose(s.context + new, 15)[:min(room, e.rows - 1)]
+                    if getattr(s, "copies", None) is not None else None)
             s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
-                             self.confidence)
+                             self.confidence, copy=copy)
         s.take(new, self._ends(s))
         return [s] if s.done else []

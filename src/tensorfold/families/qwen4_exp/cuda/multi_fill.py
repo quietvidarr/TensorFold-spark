@@ -9,7 +9,7 @@ import torch
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
 
-from . import image_rows, vision_prefix
+from . import COPY, image_rows, vision_prefix
 from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
 from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
@@ -216,6 +216,10 @@ class PromptPasses:
                 s.constraint.advance([first])
             head += 1
             s.context = list(s.prompt)
+            if COPY and mtp:
+                from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
+
+                s.copies = CopyIndex()
             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
                              self.confidence) if mtp and s.count > 1 else []
             s.started = time.perf_counter()
