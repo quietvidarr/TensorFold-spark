@@ -148,6 +148,7 @@ class State:
         self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
         # text after an image prompt rotates at its cache position plus this offset (0: no images, the plain path)
         self.image_positions, self.image_rows, self.image_features = None, (), None
+        self.vision_cache_key = None
         self.rope_delta = 0
         self.rope_delta_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
         lin = [l for l in w.layers if l.linear]
@@ -239,6 +240,7 @@ class State:
         self.set_pos(0)
         self.set_rope_delta(0)
         self.image_positions, self.image_rows, self.image_features = None, (), None
+        self.vision_cache_key = None
         self.mtp_drafted = 0
         self.set_mtp_len(0)
 
@@ -290,7 +292,11 @@ class State:
             raise ValueError(f"copy_from: {other.capacity} cache rows do not fit {self.capacity}")
         for name, value in vars(other).items():
             mine = getattr(self, name)
-            if isinstance(value, torch.Tensor):
+            if name in ("image_positions", "image_features"):
+                # Request-local immutable tensors can have different lengths or
+                # an empty destination. Fixed graph-captured buffers stay in place.
+                setattr(self, name, value)
+            elif isinstance(value, torch.Tensor):
                 into(mine, value)
             elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
                 for a, b in zip(mine, value):
@@ -348,7 +354,9 @@ class State:
         return {"pos": self.pos, "rec": self.rec[p].clone(), "conv": self.conv.clone(),
                 "ple_tail": self.ple_tail.clone(),
                 "ple_history": None if self.ple_history is None else self.ple_history.copy(),
-                "mtp_len": self.mtp_len - self.mtp_drafted}
+                "mtp_len": self.mtp_len - self.mtp_drafted,
+                "image_positions": getattr(self, "image_positions", None), "rope_delta": getattr(self, "rope_delta", 0),
+                "vision_cache_key": getattr(self, "vision_cache_key", None)}
 
     def restore(self, snap: dict) -> None:
         self.rec[0].copy_(snap["rec"])
@@ -358,7 +366,9 @@ class State:
         self.ple_history = None if snap["ple_history"] is None else snap["ple_history"].copy()
         self.ple_last = None
         self.set_pos(snap["pos"])
-        self.set_rope_delta(0)                       # kept prompts are text only
-        self.image_positions, self.image_rows, self.image_features = None, (), None
+        self.set_rope_delta(snap.get("rope_delta", 0))
+        self.image_positions = snap.get("image_positions")
+        self.image_rows, self.image_features = (), None
+        self.vision_cache_key = snap.get("vision_cache_key")
         self.mtp_drafted = 0
         self.set_mtp_len(snap["mtp_len"])

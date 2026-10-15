@@ -9,7 +9,7 @@ import torch
 from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.streams import Stream
 
-from . import image_rows
+from . import image_rows, vision_prefix
 from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
 from .forward import Cut, commit, compute, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
@@ -122,12 +122,12 @@ class PromptPasses:
     def _keep_at(s: Stream) -> int | None:
         """Where a drafting stream's prompt state is kept: one token before its end, which a next turn extends."""
 
-        return entry_end(s.prompt) if s.draft and s.st.image_positions is None else None
+        return entry_end(s.prompt) if s.draft and vision_prefix.keepable(s.st) else None
 
     def _point(self, s: Stream, start: int) -> int | None:
         """The next message-start or prompt-end snapshot this prompt piece can reach."""
 
-        if not s.draft or s.st.image_positions is not None:
+        if not s.draft or not vision_prefix.keepable(s.st):
             return None
         return next((p for p in self.fills[s.sid][0].stops if p > start), self._keep_at(s))
 

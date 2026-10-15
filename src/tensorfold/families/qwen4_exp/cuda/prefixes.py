@@ -1,8 +1,9 @@
 """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
 
 
-def _best(kept, prompt, busy=()):
+def _best(kept, prompt, busy=(), cache_key=None):
     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
+                and k[2].get("vision_cache_key") == cache_key
                 and prompt[:len(k[0])] == k[0]), key=lambda k: len(k[0]), default=None)
 
 
@@ -10,11 +11,11 @@ def _longer(kept, entry):
     return any(k[1] is entry[1] and len(k[0]) > len(entry[0]) for k in kept)
 
 
-def slot_for(owner, prompt: list[int], reuse: bool):
+def slot_for(owner, prompt: list[int], reuse: bool, cache_key=None):
     """Copy a fork into spare capacity; otherwise retain the released idle-slot and memory-pressure behavior."""
 
     busy = owner._busy()
-    best = _best(owner.kept, prompt) if reuse else None
+    best = _best(owner.kept, prompt, cache_key=cache_key) if reuse else None
     fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best))
     if fork:
         if owner.free:
@@ -28,7 +29,7 @@ def slot_for(owner, prompt: list[int], reuse: bool):
                 owner._shrink(spare, force=True)
                 raise
             owner.free.append(spare)
-        best = _best(owner.kept, prompt, busy) if reuse else None
+        best = _best(owner.kept, prompt, busy, cache_key=cache_key) if reuse else None
         if best is not None and owner.free and _longer(owner.kept, best):
             best = None
     if best is not None:
@@ -48,8 +49,10 @@ def slot_for(owner, prompt: list[int], reuse: bool):
 def remember(owner, ids, st, snap, tail) -> None:
     """Keep each slot's prefix chain, returning displaced idle slots to the free list."""
 
-    gone = [k[1] for k in owner.kept if k[0] == ids]
-    owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
+    key = snap.get("vision_cache_key")
+    same = lambda k: k[0] == ids and k[2].get("vision_cache_key") == key
+    gone = [k[1] for k in owner.kept if same(k)]
+    owner.kept = [k for k in owner.kept if not same(k)] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:
         gone.append(owner.kept.pop(0)[1])
     busy = owner._busy()

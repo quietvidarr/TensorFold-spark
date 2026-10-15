@@ -19,7 +19,7 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
-from . import attn_multi, gdn_multi, image_rows, prefixes
+from . import attn_multi, gdn_multi, image_rows, prefixes, vision_prefix
 from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
@@ -206,14 +206,16 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.memory_gate.waits += any(s.waiting for s in live)
         return ended
 
-    def _slot_for(self, prompt: list[int], reuse: bool):
+    def _slot_for(self, prompt: list[int], reuse: bool, cache_key=None):
         """Reuse kept prefixes, preferring the graph slot among otherwise free destinations."""
 
         if self.solo is not None and any(st is self.solo.st for st in self.free):
             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
-        return prefixes.slot_for(self, prompt, reuse)
+        return prefixes.slot_for(self, prompt, reuse, cache_key=cache_key)
 
     def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
+        if getattr(st, "vision_cache_key", None) is not None:
+            snap = {**snap, **vision_prefix.snapshot_metadata(st)}
         prefixes.remember(self, ids, st, snap, tail)
 
     def live(self) -> int:
@@ -253,10 +255,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
             raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
         t0 = time.perf_counter()
+        media_key = None
         if self.w.comm is not None:
             st, resume, s.cached = self._prepare_admission(s, told)
         else:
-            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            media_key = vision_prefix.cache_key(s.vision, s.prompt)
+            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and vision_prefix.reusable(s.vision, media_key),
+                                                cache_key=media_key)
         if self.w.comm is None:
             try:
                 if not self._grow(st, len(s.prompt) + self.depth + 2,
@@ -273,6 +278,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         try:
             begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
             image_rows.begin(e, s, self.vision)
+            if self.w.comm is None:
+                st.vision_cache_key = media_key
         except Exception:
             self._drop_kept(st)
             self.free.append(st)
@@ -281,7 +288,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             e.stops = list(s.stops)
         else:
             e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
-                if s.draft and st.image_positions is None and self.points is not None else []
+                if s.draft and vision_prefix.keepable(st) and self.points is not None else []
         s.sid, s.st = self.next_id, st
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
