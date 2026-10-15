@@ -99,7 +99,7 @@ def kernel_version(model: Any) -> str:
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
-                context: int | None = None, **options: Any):
+                mtp_confidence: float | None = None, context: int | None = None, **options: Any):
     """One GPU: MTP chains verified exactly, or the serial reference when no_drafts is set."""
     # parallel above 1 decodes that many requests together.
 
@@ -107,12 +107,13 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         raise ValueError(f"{TITLE} drafts with its own MTP layer on CUDA: a separate draft model does not apply")
     if int(tp) != 1:
         raise ValueError(f"{TITLE} runs on one GPU: drop --tp")
-    from .cuda import DEPTH
+    from .cuda import CONFIDENCE, DEPTH
     from .cuda.engine import Qwen36Engine
 
     depth = 0 if no_drafts else DEPTH if mtp_drafts is None else int(mtp_drafts)
     streams = max(1, int(options.get("parallel") or 1))
     if streams > 1 and not 0 <= depth <= 15:
         raise ValueError(f"--parallel verifies up to 16 rows a stream: --mtp-drafts 0 to 15, not {depth}")
-    return Qwen36Engine(Path(model_dir), depth=depth, context=context, context_explicit=options.get("context_explicit"),
+    confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
+    return Qwen36Engine(Path(model_dir), depth=depth, confidence=confidence, context=context, context_explicit=options.get("context_explicit"),
                         streams=streams, keep=options.get("checkpoint_slots"))

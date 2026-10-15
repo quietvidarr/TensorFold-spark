@@ -14,16 +14,18 @@ from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
 from tensorfold.engine.grammar import GrammarError
 from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
 from tensorfold.families.qwen3_5.cuda.engine import entry_end
-from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward
+from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward, replay_pending
 from tensorfold.families.qwen3_5.cuda.multi import kept, private
 
 from tensorfold.cuda import keep_rank
 
-from . import disk_points
+from . import disk_points, policy_for
 from .decode import COPY_ROWS, Carry, extend, mtp_round, picks
 from .mtp import Cache, Head
 
 STEP = int(os.environ.get("TF_PREFILL_STEP", "1024"))   # prompt rows a prefill step takes while other streams decode
+# a round's accepted DeltaNet rows are stepped into the states by the next round's tree kernel (no replay pass)
+DEFER = os.environ.get("TF_QWEN36_GDN_DEFER", "1") != "0"
 
 
 class KeptEnds(PrefixCache):
@@ -223,7 +225,7 @@ class MultiDecoder:
         wins = [[s.out[-1]] + s.drafts for s in live]
         chains = [list(range(-1, len(t) - 1)) for t in wins]
         logits, record, hidden, starts = multi_tree_forward(
-            self.w, [(t, p, s.st) for t, p, s in zip(wins, chains, live)], hidden=True)
+            self.w, [(t, p, s.st) for t, p, s in zip(wins, chains, live)], hidden=True, pending=self._pending(live))
         for k, s in enumerate(live):                  # a constrained stream's rows, each masked by its path
             if s.sid in grammars:
                 s.constraint.mask(logits[starts[k]:starts[k + 1]], grammars[s.sid])
@@ -231,8 +233,12 @@ class MultiDecoder:
         sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
         kept_rows = [accept(t, p, rows, s.count - len(s.out), self._ends(s))
                      for s, t, p, rows in zip(live, wins, chains, sampled)]
-        commit_streams([s.st for s in live], record, [[starts[k] + r for r in path]
-                                                      for k, (path, _) in enumerate(kept_rows)], in_place=True)
+        paths = [[starts[k] + r for r in path] for k, (path, _) in enumerate(kept_rows)]
+        commit_streams([s.st for s in live], record, paths, in_place=True, defer=DEFER)
+        if DEFER:
+            self.last_record = record
+            for s, path in zip(live, paths):
+                s.pend = (record, path)
         for k, (s, tokens, (path, end)) in enumerate(zip(live, wins, kept_rows)):
             new = [tokens[r] for r in path[1:]] + [end]
             s.committed.extend(tokens[r] for r in path)
@@ -285,13 +291,15 @@ class MultiDecoder:
         """The lone stream's round in the one-stream graphs, its state moved into their buffers once (eager there when others join)."""
 
         g, d = self.graphs, s.snap
+        depth, conf, before = policy_for(1, self.depth, self.confidence)
+        self._flush([s])
         if self.resident is not s:
             s.st, d.cache = g.load(s.st, d.cache, min(g.capacity, len(s.prompt) + s.count + COPY_ROWS))
             self.resident = s
         try:
             tokens, path, new, d.carry = mtp_round(s.st, d.cache, d.carry, s.out[-1], s.count - len(s.out),
-                                                   s.sampling, s.context, s.copies, depth=self.depth,
-                                                   confidence=self.confidence, ids=self.head.ids, verify=g.verify,
+                                                   s.sampling, s.context, s.copies, depth=depth,
+                                                   confidence=conf, before=before, ids=self.head.ids, verify=g.verify,
                                                    step=g.draft, eos=self._ends(s), in_place=True,
                                                    constraint=s.constraint)
         except GrammarError as exc:                   # this request ends with its error
@@ -302,6 +310,35 @@ class MultiDecoder:
         s.take(new, self._ends(s))
         return [s] if s.done else []
 
+    @staticmethod
+    def _flush(streams) -> None:
+        """Step the streams' deferred rows into their states now (one replay launch a record)."""
+
+        by: dict[int, tuple] = {}
+        for s in streams:
+            p = getattr(s, "pend", None)
+            if p is not None:
+                group = by.setdefault(id(p[0]), (p[0], [], []))
+                group[1].append(s.st)
+                group[2].append(p[1])
+                s.pend = None
+        for record, states, rows in by.values():
+            replay_pending(states, record, rows)
+
+    def _pending(self, live: list[Stream]):
+        """(record, rows a stream) for ``multi_tree_forward``: the deferred rows of the last forward's record; a stream
+        holding an older record's rows (none in steady state) is stepped eagerly first."""
+
+        last = getattr(self, "last_record", None)
+        self._flush([s for s in live if getattr(s, "pend", None) is not None and s.pend[0] is not last])
+        if not any(getattr(s, "pend", None) is not None for s in live):
+            return None
+        rows = []
+        for s in live:
+            rows.append(s.pend[1] if getattr(s, "pend", None) is not None else [])
+            s.pend = None                             # the forward steps them
+        return last, rows
+
     def _propose(self, live: list[Stream]) -> None:
         """Every drafting stream's carry absorbed in one head call, then a copy or an MTP chain each, the chains stepped together."""
 
@@ -310,6 +347,7 @@ class MultiDecoder:
         todo = [s for s in live if s.snap is not None]
         if not todo:
             return
+        depth, conf, before = policy_for(len(live), self.depth, self.confidence)
         heads = [s.snap for s in todo]
         normed = self.head.forward_streams([d.cache for d in heads], [d.carry.states for d in heads],
                                            [d.carry.tokens for d in heads], [d.cache.pos for d in heads])
@@ -332,8 +370,10 @@ class MultiDecoder:
                            [s.sampling for s, _ in active], self.ids)
             going = []
             for k, ((s, _), (token, prob)) in enumerate(zip(active, chosen)):
+                if before and s.drafts and prob < conf:       # ``before``: the low draft is not verified
+                    continue
                 s.drafts.append(token)
-                if prob >= self.confidence and len(s.drafts) < self.depth:
+                if prob >= conf and len(s.drafts) < depth:
                     going.append((s, k))
             if not going:
                 return

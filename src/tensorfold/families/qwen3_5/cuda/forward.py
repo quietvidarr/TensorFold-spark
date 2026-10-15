@@ -16,6 +16,9 @@ from . import glue
 from .qmm_fast import matmul, matmul_group
 from .weights import Plain, QLinear, Weights
 
+# multi-stream forwards read each stream's conv window through a pointer table (TF_GDN_CONV_PTRS=0: concatenated)
+CONV_PTRS = __import__("os").environ.get("TF_GDN_CONV_PTRS", "1") != "0"
+
 
 def _mm(x: torch.Tensor, w: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
     if not isinstance(w, QLinear):
@@ -304,8 +307,12 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
 @torch.no_grad()
 def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequence[int], State]], *,
                        full_logits: bool = True, tp: bool = False, capture_taps: bool = False,
-                       hidden: bool = False):
-    """Several streams' windows in one forward, each row with the bits of its stream's own ``tree_forward`` (``hidden``: the rows' final normed states third)."""
+                       hidden: bool = False, pending: tuple | None = None):
+    """Several streams' windows in one forward, each row with the bits of its stream's own ``tree_forward`` (``hidden``: the rows' final normed states third).
+
+    ``pending`` (record, rows a stream): the accepted rows of the previous forward's ``record`` that ``commit_streams(...,
+    defer=True)`` left out of each stream's DeltaNet states; the tree kernel steps them in first (the same steps as the
+    replay, in place), so the states and outputs have the bits of an eager commit."""
 
     c = w.config
     device = w.norm.device
@@ -334,19 +341,37 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
     linear = [i for i, layer in enumerate(w.layers) if layer.linear]
     softmax = [i for i, layer in enumerate(w.layers) if not layer.linear]
     ptrs = [p for i in linear for p in deltanet.pointers([st.rec[i] for st in states])]
-    tables = dict(zip(linear, deltanet.to_device(ptrs, torch.int64, device).view(len(linear), len(states))))
+    if CONV_PTRS and len(states) > 1 and linear:   # each stream's conv window read in place (no per-layer cat)
+        ptrs += [p for i in linear for p in deltanet.pointers([st.conv[i] for st in states])]
+    dev_ptrs = deltanet.to_device(ptrs, torch.int64, device).view(-1, len(linear), len(states))
+    tables = dict(zip(linear, dev_ptrs[0]))
+    conv_tables = dict(zip(linear, dev_ptrs[1])) if dev_ptrs.shape[0] > 1 else {}
     aoffs = _cache_offsets(states, softmax, device)
     S = len(states)
     attn_flat, attn_items, attn_chunks = tree_attention.plan_host(local, [st.pos for st in states],
                                                                   c.heads // c.kv_heads)
-    host = torch.tensor(positions + sids + entries + starts + ids + [i for win in windows for i in win] + attn_flat,
-                        dtype=torch.int32).pin_memory()
+    pend_flat: list[int] = []
+    if pending is not None:
+        prev, prows = pending
+        pw = prev[0].k.shape[0]
+        for rows in prows:
+            pend_flat += list(rows) + [0] * (pw - len(rows)) + [len(rows)]
+    host = torch.tensor(positions + sids + entries + starts + ids + [i for win in windows for i in win] + pend_flat
+                        + attn_flat, dtype=torch.int32).pin_memory()
     dev = host.to(device, non_blocking=True)            # one copy, and the host runs on
     pos, sid_t = dev[:W], dev[W:2 * W]
     plan = deltanet.Plan(dev[2 * W:5 * W].view(W, 3), dev[5 * W:5 * W + S + 1], slots, most)
     ids_t = dev[5 * W + S + 1:6 * W + S + 1]
     windows_t = dev[6 * W + S + 1:6 * W + S + 1 + W * (keep + 1)].view(W, keep + 1)
-    aplan = tree_attention.from_packed(dev[6 * W + S + 1 + W * (keep + 1):], S, W, attn_items, attn_chunks)
+    at = 6 * W + S + 1 + W * (keep + 1)
+    pend_args = {}
+    if pending is not None:
+        packed = dev[at:at + len(pend_flat)].view(S, pw + 1)
+        at += len(pend_flat)
+        for j, item in enumerate(prev):
+            if isinstance(item, GDNRecord):
+                pend_args[j] = [item.k, item.v, item.g, item.beta, packed[:, :pw], packed[:, pw]]
+    aplan = tree_attention.from_packed(dev[at:], S, W, attn_items, attn_chunks)
     x = glue.embedding(ids_t, w.embed)
     pending: torch.Tensor | None = None
     record: list[Record] = []
@@ -364,10 +389,14 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
             else:
                 qkv, z, b, a = _mm_group(h, [gdn.qkv, gdn.z, gdn.b, gdn.a], xs)
                 z = z.reshape(W, c.v_heads, c.dv)
-            conv = states[0].conv[i] if S == 1 else torch.cat([st.conv[i] for st in states])
+            if i in conv_tables:
+                conv = states[0].conv[i]
+            else:
+                conv = states[0].conv[i] if S == 1 else torch.cat([st.conv[i] for st in states])
             q, k, v, g, beta = glue.gdn_pre(qkv, conv, gdn.conv, windows_t, a, b, gdn.A_log, gdn.dt_bias,
-                                            kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=sid_t, nkeep=keep)
-            yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i])
+                                            kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=sid_t, nkeep=keep,
+                                            conv_table=conv_tables.get(i))
+            yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i], pending=pend_args.get(i))
             out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
             r = _row_mm(out, gdn.out, tp, out_xs)
             record.append(GDNRecord(q, k, v, g, beta, qkv))
@@ -427,25 +456,51 @@ def commit(st: State, record: Sequence[Record], path: Sequence[int], indices: tu
 
 
 def commit_streams(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]],
-                   indices: list | None = None, *, in_place: bool = False) -> None:
-    """Commit each stream's accepted path into its own state with one GDN replay launch for every stream (``in_place``: states nothing else holds)."""
+                   indices: list | None = None, *, in_place: bool = False, defer: bool = False) -> None:
+    """Commit each stream's accepted path into its own state with one GDN replay launch for every stream (``in_place``: states nothing else holds).
+
+    ``defer`` (with ``in_place``): the DeltaNet states are left for the next ``multi_tree_forward(pending=...)`` or
+    ``replay_pending`` to step (conv windows and attention caches are committed now)."""
 
     indices = indices if indices is not None else path_indices(record, paths)
     width = record[0].k.shape[0]
     packed = indices[0][0].as_strided((len(paths), width + 1), (width + 1, 1))    # path_indices' one copy
-    _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place)
+    _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place,
+            defer=defer)
+
+
+def replay_pending(states: Sequence[State], record: Sequence[Record], rows: Sequence[Sequence[int]]) -> None:
+    """Step deferred rows (``commit_streams(defer=True)``) into the states in place: one replay launch."""
+
+    linear = [(i, item) for i, item in enumerate(record) if isinstance(item, GDNRecord)]
+    if not linear or not states:
+        return
+    items = [item for _, item in linear]
+    width = record[0].k.shape[0]
+    flat: list[int] = []
+    for r in rows:
+        flat += list(r) + [0] * (width - len(r)) + [len(r)]
+    dev = deltanet.to_device(flat, torch.int32, items[0].k.device).view(len(states), width + 1)
+    ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
+                                 [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
+    table = deltanet.to_device(ptrs, torch.int64, items[0].k.device)
+    deltanet.replay(table, len(items), len(states), dev[:, :width], dev[:, width], items[0].k, items[0].v,
+                    in_place=True)
 
 
 def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]], rows: torch.Tensor,
-            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False) -> None:
+            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False, defer: bool = False) -> None:
     if any(not p for p in paths) or any(len(record) != len(st.rec) for st in states):
         raise ValueError("record and nonempty paths required")
     # one GDN replay launch covers every layer and stream
     linear = [(i, item) for i, item in enumerate(record) if isinstance(item, GDNRecord)]
     att = [(i, item) for i, item in enumerate(record) if not isinstance(item, GDNRecord)]
     replayed = None
+    if defer and not in_place:
+        raise ValueError("a deferred commit steps the states in place")
     if linear:
         items = [item for _, item in linear]
+    if linear and not defer:
         ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
                                      [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
         table = deltanet.to_device(ptrs, torch.int64, rows.device)

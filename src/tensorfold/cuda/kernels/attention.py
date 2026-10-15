@@ -250,12 +250,22 @@ def plan_host(parents: Sequence[Sequence[int]], lengths: Sequence[int], group: i
     return rows + streams + items + glob, len(items) // 3, most
 
 
+def live_chunks(w: int, context: int) -> int:
+    """Chunk codes -1-j that any p <= context can run for a w-row window (``_shared`` runs chunk groups(p, w) * GROUP
+    + j iff its keys are all below p): the rest of a padded plan's chunk items would only exit."""
+
+    most = 0
+    for p in range(CHUNK, context + 1, CHUNK):           # p // CHUNK and groups(p, w) change only at multiples of CHUNK
+        most = max(most, p // CHUNK - groups(p, w) * GROUP)
+    return min(most, context // CHUNK)
+
+
 def padded_host(parents: Sequence[int], context: int, group: int) -> tuple[list[int], int, int]:
     """A graph includes all groups and chunks below its context; kernels skip items its keys do not fill."""
 
     flat, _, _ = plan_host([parents], [0], group)            # rows, the stream's row (refreshed per replay), parents
     w = len(parents)
-    codes = list(range(context // SPAN)) + [-1 - j for j in range(context // CHUNK)]
+    codes = list(range(context // SPAN)) + [-1 - j for j in range(live_chunks(w, context))]
     items = [x for code in codes for first in range(0, w * group, QUERY_TILE) for x in (0, first, code)]
     most = -(-(context + w) // CHUNK)                        # ``slots`` of any p <= context is at most this
     return flat[:w + 4] + items + flat[w + 4:], len(items) // 3, most

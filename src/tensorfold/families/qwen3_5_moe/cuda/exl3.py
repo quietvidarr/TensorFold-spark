@@ -88,9 +88,9 @@ class Exl3Routed:
             moe.select_rows(b.logits[:n], b, self.top_k, self.count)
             if prompt:
                 routed(xr, b.pick[:n], b.wts[:n], self.experts, b.x3, b.out[:n], n, prompt=True, summed=True)
-            else:
-                routed(xr, b.pick[:n], b.wts[:n], self.experts, b.x3, b.out[:n], n)
-            out[r0:r0 + n].copy_(b.out[:n])
+                out[r0:r0 + n].copy_(b.out[:n])
+            else:                                        # the combine also writes the bf16 rows (no copy launch)
+                routed(xr, b.pick[:n], b.wts[:n], self.experts, b.x3, b.out[:n], n, out16=out[r0:r0 + n])
         return out
 
 

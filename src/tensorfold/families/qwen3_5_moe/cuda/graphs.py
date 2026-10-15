@@ -11,7 +11,12 @@ from tensorfold.families.qwen3_5.cuda.forward import State, reserve, stage, tree
 
 from .mtp import Cache, Head, Staged as HeadStaged
 
-BUCKET = 8192        # smallest context span a graph covers; larger contexts take the next power of two
+import os
+
+BUCKET = 8192        # smallest buffer the graphs take; larger contexts grow it by powers of two (graphs recaptured)
+# graphs keyed on the buffers' capacity alone (one capture a width while the buffers keep their size); and the buffers'
+# rows taken at once (0: grown by powers of two as requests need), e.g. the slot capacity: never recaptured
+GRAPH_ROWS = int(os.environ.get("TF_QWEN36_GRAPH_ROWS", "0"))
 
 
 class Graphs:
@@ -25,13 +30,13 @@ class Graphs:
         self.mtp: dict[tuple[int, int], tuple] = {}
 
     def _bucket(self, end: int) -> int:
-        return min(self.rows, max(BUCKET, 1 << (end - 1).bit_length()))
+        return self.rows                                # padded plans skip what the keys don't fill
 
     def load(self, st: State, mc: Cache, need: int) -> tuple[State, Cache]:
         """A request's committed state and head cache in the fixed buffers, grown (graphs dropped) past ``need`` rows."""
 
         if need > self.rows:
-            self.rows = min(self.capacity, max(BUCKET, 1 << (need - 1).bit_length()))
+            self.rows = min(self.capacity, max(BUCKET, GRAPH_ROWS, 1 << (need - 1).bit_length()))
             self.target.clear()
             self.mtp.clear()
             self.st = self.mc = None

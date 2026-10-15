@@ -45,18 +45,24 @@ def add_rmsnorm(x: torch.Tensor, r: torch.Tensor | None, w: torch.Tensor, eps: f
 @triton.jit
 def _gdn_pre(QKV, CS, CW, WIN, A, B, ALOG, DTB, Q, K, V, G, BETA, SID,
              C: tl.constexpr, KH: tl.constexpr, VH: tl.constexpr, DK: tl.constexpr, NKEEP: tl.constexpr,
-             MULTI: tl.constexpr):
-    """Program (row, head): conv, SiLU, RMS-scaled q/k, plain v; ``MULTI``: row r's conv rows at CS[SID[r] * NKEEP]."""
+             MULTI: tl.constexpr, PTRS: tl.constexpr = False):
+    """Program (row, head): conv, SiLU, RMS-scaled q/k, plain v; ``MULTI``: row r's conv rows at CS[SID[r] * NKEEP]
+    (``PTRS``: CS is a table of each stream's conv-state address, row r's at CS[SID[r]])."""
 
     row = tl.program_id(0)
     head = tl.program_id(1)                   # 0..KH-1 q, KH..2KH-1 k, then VH v heads
     ch = head * DK + tl.arange(0, DK)
     acc = tl.zeros((DK,), dtype=tl.float32)
-    cs_row = tl.load(SID + row) * NKEEP if MULTI else 0
+    if PTRS:
+        cs = tl.load(CS + tl.load(SID + row)).to(tl.pointer_type(tl.bfloat16))
+        cs_row = 0
+    else:
+        cs = CS
+        cs_row = tl.load(SID + row) * NKEEP if MULTI else 0
     for j in tl.static_range(NKEEP + 1):
         src = tl.load(WIN + row * (NKEEP + 1) + j)
         from_state = src < NKEEP
-        xs = tl.load(CS + (cs_row + src) * C + ch, mask=(ch < C) & from_state, other=0.0)
+        xs = tl.load(cs + (cs_row + src) * C + ch, mask=(ch < C) & from_state, other=0.0)
         xw = tl.load(QKV + (src - NKEEP) * C + ch, mask=(ch < C) & (src >= NKEEP), other=0.0)
         x = tl.where(from_state, xs, xw).to(tl.float32)
         w = tl.load(CW + ch * (NKEEP + 1) + j).to(tl.float32)
@@ -86,11 +92,13 @@ def _gdn_pre(QKV, CS, CW, WIN, A, B, ALOG, DTB, Q, K, V, G, BETA, SID,
 
 def gdn_pre(qkv: torch.Tensor, conv_state: torch.Tensor, conv_w: torch.Tensor, windows: torch.Tensor,
             a: torch.Tensor, b: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor, *, kh: int, vh: int, dk: int,
-            stream_ids: torch.Tensor | None = None, nkeep: int | None = None):
-    """windows (W, nkeep + 1) index [conv_state; qkv]; given ``stream_ids``, state indices are per stream."""
+            stream_ids: torch.Tensor | None = None, nkeep: int | None = None, conv_table: torch.Tensor | None = None):
+    """windows (W, nkeep + 1) index [conv_state; qkv]; given ``stream_ids``, state indices are per stream
+    (``conv_table``: int64 addresses of each stream's bf16 conv state, read in place instead of ``conv_state``)."""
 
     W, C = qkv.shape
     nkeep = conv_state.shape[0] if nkeep is None else nkeep
+    ptrs = conv_table is not None
     dev = qkv.device
     q = torch.empty((W, kh, dk), dtype=torch.bfloat16, device=dev)
     k = torch.empty((W, kh, dk), dtype=torch.bfloat16, device=dev)
@@ -98,9 +106,9 @@ def gdn_pre(qkv: torch.Tensor, conv_state: torch.Tensor, conv_w: torch.Tensor, w
     g = torch.empty((W, vh), dtype=torch.float32, device=dev)
     beta = torch.empty((W, vh), dtype=torch.float32, device=dev)
     multi = stream_ids is not None
-    _gdn_pre[(W, 2 * kh + vh)](qkv, conv_state, conv_w, windows, a, b, A_log, dt_bias, q, k, v, g, beta,
-                              stream_ids if multi else windows, C=C, KH=kh, VH=vh, DK=dk, NKEEP=nkeep, MULTI=multi,
-                              num_warps=2)
+    _gdn_pre[(W, 2 * kh + vh)](qkv, conv_table if ptrs else conv_state, conv_w, windows, a, b, A_log, dt_bias, q, k,
+                              v, g, beta, stream_ids if multi else windows, C=C, KH=kh, VH=vh, DK=dk, NKEEP=nkeep,
+                              MULTI=multi, PTRS=ptrs, num_warps=2)
     return q, k, v, g, beta
 
 
