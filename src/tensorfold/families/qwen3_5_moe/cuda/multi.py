@@ -135,19 +135,27 @@ class MultiDecoder:
 
         s = next_fill(self.filling)
         pos, n = s.st.pos, len(s.prompt)
-        stop = next((p for p in s.stops if p > pos), n)
+        stop = n                                 # patch 0126: points are kept inside the step's passes, never cut one
         if s.background or any(not x.done for x in self.streams.values()):   # a later foreground prompt waits one step
             stop = min(stop, pos + STEP)
         try:
             first = self._step(s, stop)
         except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
+            s.later = []
             self.filling = [x for x in self.filling if x is not s]
             s.error, s.done = exc, True
             return [s]
         if first is None:
+            self._flush_points(s)
             return []
         s.take([first], self._ends(s))
+        self._flush_points(s)                    # the points' disk copies after the first token, not before it
         return [s] if s.done else []
+
+    def _flush_points(self, s: Stream) -> None:
+        for args in getattr(s, "later", ()):
+            self._add(*args)
+        s.later = []
 
     def _keep(self, ids: list[int], s: Stream) -> None:
         d = s.snap
@@ -172,17 +180,18 @@ class MultiDecoder:
         end = (entry_end(s.prompt) if d is not None and not
                (s.stops and len(s.prompt) - s.stops[-1] < MIN_GAP) else None)
 
-        def keep(point, state, cache, held):
-            self._add(list(s.prompt[:point]), kept(state), (cache.view(), held.clone()))
+        s.later = []
+
+        def keep(point, state, cache, held):     # added (and queued for the disk) once the step has sampled
+            s.later.append((list(s.prompt[:point]), kept(state), (cache.view(), held.clone())))
 
         try:
             normed, held = extend(self.w, self.head if d is not None else None, s.prompt, s.st,
                                   d.cache if d is not None else None, d.carry.states if d is not None else None, stop,
-                                  keep_at=end, keep=keep if end is not None else None)
+                                  keep_at=end, keep=keep if end is not None or s.stops else None,
+                                  points=[p for p in s.stops if s.st.pos < p <= stop])
             if d is not None:
                 d.carry = Carry(held, [])
-            if stop in s.stops:
-                self._keep(list(s.prompt[:stop]), s)
             first = None
             if stop == len(s.prompt):
                 logits = _mm(normed[-1:], self.w.head)

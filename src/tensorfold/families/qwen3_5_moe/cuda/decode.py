@@ -185,12 +185,8 @@ def prefill(w, head: Head | None, prompt: Sequence[int], sampling: Sampling | No
     if head is not None:
         mc = cache.view(len(prompt)) if cache is not None else Cache(w, len(prompt))      # the prompt's rows only
     normed = None
-    bounds = sorted({p for p in stops if st.pos < p < len(prompt)} | {len(prompt)}) if keep is not None else \
-        [len(prompt)]
-    for end in bounds:
-        normed, held = extend(w, head, prompt, st, mc, held, end, keep_at=keep_at, keep=keep)
-        if end < len(prompt):
-            keep(end, clone_state(st), mc.view() if mc is not None else None, held)
+    points = [p for p in stops if st.pos < p < len(prompt)] if keep is not None else []
+    normed, held = extend(w, head, prompt, st, mc, held, len(prompt), keep_at=keep_at, keep=keep, points=points)
     logits = _mm(normed[-1:], w.head)
     if constraint is not None:                           # a reply's grammar (tensorfold.engine.grammar)
         logits = constraint.mask(logits)
@@ -203,20 +199,23 @@ def prefill(w, head: Head | None, prompt: Sequence[int], sampling: Sampling | No
 
 @torch.no_grad()
 def extend(w, head: Head | None, prompt: Sequence[int], st: State, mc: Cache | None, held: torch.Tensor | None,
-           end: int, *, keep_at: int | None = None, keep: Callable | None = None
+           end: int, *, keep_at: int | None = None, keep: Callable | None = None, points: Sequence[int] = ()
            ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Commit prompt[st.pos:end] in chunks (bits independent of ``end``); the head absorbs every row but the last, returned held."""
+    """Commit prompt[st.pos:end] in chunks (bits independent of ``end``); the head absorbs every row but the last, returned held.
+    ``keep(p, state, head cache, held row)`` gets the state after prompt[:p] for ``keep_at`` and every one of ``points``
+    in [st.pos, end], captured inside the chunks (patch 0126: no pass ends at a point; a chunk's DeltaNet chains split
+    there with one launch's bits, the attention rows are the chunk's own)."""
 
     ids = torch.tensor(list(prompt[st.pos:end]), dtype=torch.int32, device=w.norm.device)
     base, normed = st.pos, None
-    saved = False
+    want = sorted({p for p in points if base < p <= end} | ({keep_at} if keep_at is not None and base < keep_at <= end
+                                                             else set())) if keep is not None else []
     for a, b in chunks(st.pos, end):
-        if keep is not None and keep_at == a and not saved:
-            keep(a, clone_state(st), mc.view() if mc is not None else None,
-                 held.clone() if held is not None else None)
-            saved = True
-        cut = keep_at - a if keep_at is not None and a < keep_at < b else 0
-        normed, _, *part = prefill_chunk(w, ids[a - base:b - base], st, every=head is not None, cut=cut)
+        for p in [p for p in want if p == a]:          # a point at a chunk's start: the state as committed
+            keep(a, clone_state(st), mc.view() if mc is not None else None, held.clone() if held is not None else None)
+            want.remove(p)
+        inner = [p - a for p in want if a < p < b]
+        normed, _, *part = prefill_chunk(w, ids[a - base:b - base], st, every=head is not None, cuts=inner)
         if head is not None:
             rows = normed if held is None else torch.cat([held, normed])
             start = a - (0 if held is None else 1)
@@ -224,14 +223,15 @@ def extend(w, head: Head | None, prompt: Sequence[int], st: State, mc: Cache | N
                 head.forward(mc, rows[:-1], prompt[start + 1:b], start)
                 mc.pos = b - 1
             held = rows[-1:]
-        if keep is not None and keep_at is not None and a < keep_at <= b:
-            snapshot = part[0] if part else clone_state(st)
+        parts = part[0] if part else {}
+        for p in [p for p in want if a < p <= b]:
+            snapshot = parts[p - a] if p < b else clone_state(st)
             head_cache = mc.view() if mc is not None else None
             if head_cache is not None:
-                head_cache.pos = keep_at - 1
-            tail = normed[keep_at - a - 1:keep_at - a].clone() if head is not None else None
-            keep(keep_at, snapshot, head_cache, tail)
-            saved = True
+                head_cache.pos = p - 1
+            tail = normed[p - a - 1:p - a].clone() if head is not None else None
+            keep(p, snapshot, head_cache, tail)
+            want.remove(p)
     return normed, held
 
 

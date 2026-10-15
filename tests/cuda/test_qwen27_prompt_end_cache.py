@@ -174,6 +174,26 @@ def test_a_cut_chunk_commits_as_one_and_returns_the_state_at_the_cut(w, cut, cac
     _assert_same_state(part, prefix)
 
 
+@pytest.mark.parametrize("cuts", [[1, 2], [31, 32, 33], [5, 100, 299], [64, 128, 200, 250, 298]])
+@pytest.mark.parametrize("cached", [0, 137])
+def test_many_cuts_in_one_chunk_keep_every_prefix_state(w, cuts, cached):
+    """Patch 0126: one chunk keeps the state at several points (no pass ends at a point): the chunk's rows and final
+    state are one launch's, each point's state is a prefill stopped there."""
+
+    tokens = _prompt(cached + 300, seed=23)
+    one, two = (_chunked(w, tokens, [(0, cached)] if cached else []) for _ in range(2))
+    ids = _ids(tokens)
+    h_one, _ = prefill_chunk(w, ids[cached:], one)
+    h_two, _, parts = prefill_chunk(w, ids[cached:], two, cuts=cuts)
+    assert _same_bits(h_one, h_two) and sorted(parts) == sorted(cuts)
+    _assert_same_state(two, one)
+    for c in cuts:
+        prefix = _chunked(w, tokens, [(0, cached)] if cached else [])
+        prefill_chunk(w, ids[cached:cached + c], prefix)
+        assert parts[c].pos == cached + c and _shares_kv(parts[c], two)
+        _assert_same_state(parts[c], prefix)
+
+
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 127, 128, 129, 300, CHUNK + 1, CHUNK + 3])
 def test_keeping_a_point_leaves_the_prefill_unchanged_and_keeps_the_prefix_state(monkeypatch, w, n):
     prompt = _prompt(n)

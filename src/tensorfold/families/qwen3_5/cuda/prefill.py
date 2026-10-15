@@ -81,7 +81,7 @@ def _row_mm(x, w: QLinear, tp: bool) -> torch.Tensor:
 
 @torch.no_grad()
 def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = False, capture_taps: bool = False,
-                  last: bool = True, every: bool = False, cut: int = 0, vision=None):
+                  last: bool = True, every: bool = False, cut: int = 0, vision=None, cuts: Sequence[int] = ()):
     """Commit ``tokens`` at [st.pos, st.pos + W) into ``st`` without writing through its entries (``every``: all rows' final normed states; ``cut``: also the state after the first ``cut`` rows, the GDN chains run as two launches with one launch's bits)."""
 
     c = w.config
@@ -89,6 +89,12 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     W = int(tokens.shape[0])
     if not 0 <= cut < W:
         raise ValueError(f"cut {cut} is not inside a chunk of {W} rows")
+    # ``cuts``: the states after each of these row counts (one chunk, no extra pass; patch 0126): each DeltaNet chain
+    # runs as len(cuts) + 1 launches with one launch's bits, the attention rows are the chunk's (shared buffers)
+    many = bool(cuts)
+    marks = sorted(set(cuts) | ({cut} if cut else set()))
+    if any(not 0 < m < W for m in marks):
+        raise ValueError(f"cuts {marks} are not inside a chunk of {W} rows")
     p0 = st.pos
     keep = c.conv_kernel - 1
     dev = tokens.device
@@ -103,7 +109,8 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
         x = replace_rows(x, vision, p0, p0 + W)
     pending: torch.Tensor | None = None
     taps: list[torch.Tensor] = []
-    part = clone_state(st) if cut else None     # its attention buffers are the chunk's, through the shared list
+    parts = [clone_state(st) for _ in marks]    # their attention buffers are the chunk's, through the shared list
+    part = parts[0] if parts else None
     for i, layer in enumerate(w.layers):
         x, h = pg.add_rmsnorm(x, pending, layer.input_norm, c.eps)
         if layer.linear:
@@ -120,13 +127,17 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
             q, k, v, g, beta = glue.gdn_pre(qkv, st.conv[i], gdn.conv, windows, a, b, gdn.A_log, gdn.dt_bias,
                                             kh=c.k_heads, vh=c.v_heads, dk=c.dk)
             final = torch.empty_like(st.rec[i])
-            if part is None:
+            if not parts:
                 yr = deltanet.chain(q, k, v, g, beta, st.rec[i], final)
             else:
-                part.rec[i] = torch.empty_like(st.rec[i])
-                yr = torch.cat([deltanet.chain(q[:cut], k[:cut], v[:cut], g[:cut], beta[:cut], st.rec[i], part.rec[i]),
-                                deltanet.chain(q[cut:], k[cut:], v[cut:], g[cut:], beta[cut:], part.rec[i], final)])
-                part.conv[i] = torch.cat([st.conv[i], qkv[max(0, cut - keep):cut]])[-keep:].contiguous()
+                ys, s0, src = [], 0, st.rec[i]
+                for m, pt in zip(marks, parts):
+                    pt.rec[i] = torch.empty_like(st.rec[i])
+                    ys.append(deltanet.chain(q[s0:m], k[s0:m], v[s0:m], g[s0:m], beta[s0:m], src, pt.rec[i]))
+                    pt.conv[i] = torch.cat([st.conv[i], qkv[max(0, m - keep):m]])[-keep:].contiguous()
+                    s0, src = m, pt.rec[i]
+                ys.append(deltanet.chain(q[s0:], k[s0:], v[s0:], g[s0:], beta[s0:], src, final))
+                yr = torch.cat(ys)
             r = None
             if not tp and pg is prefill_bf16 and hasattr(gdn.out, "prefill_rotated"):   # an EXL3 out projection
                 r = gdn.out.prefill_rotated(W, lambda suh, xh: glue.gated_norm_rot(yr, z, gdn.norm, c.eps, suh, xh), dev)
@@ -171,9 +182,12 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     elif last:
         _, normed, _ = glue.add_rmsnorm(x[-1:].contiguous(), pending[-1:].contiguous(), w.norm, c.eps)
     taps_out = torch.cat(taps, dim=-1) if capture_taps else None
+    for m, pt in zip(marks, parts):
+        pt.pos = p0 + m                             # the chunk's buffers: their rows below pos stay as committed
+    if many:
+        return normed, taps_out, dict(zip(marks, parts))
     if part is None:
         return normed, taps_out
-    part.pos = p0 + cut                             # the chunk's buffers: their rows below part.pos stay as committed
     return normed, taps_out, part
 
 
