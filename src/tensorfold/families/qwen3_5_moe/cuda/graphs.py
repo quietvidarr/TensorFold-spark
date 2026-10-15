@@ -66,7 +66,9 @@ class Graphs:
         enabled = gc.isenabled()
         gc.disable()                                    # collecting an old graph mid-capture invalidates it
         try:
-            with torch.cuda.graph(g, pool=self.pool):
+            # thread_local (as Flash's graphs): the prompt store's writer thread may touch CUDA (pinned copies, events)
+            # while a graph captures; in global mode that call invalidated the capture and failed the request
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
                 out = fn()
         finally:
             if enabled:
