@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import json
 import time
 from datetime import timedelta
@@ -13,7 +15,8 @@ from . import CONFIDENCE, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
 KEEP_SERIAL = 4          # prompt states the serial engine keeps (they share its attention rows)
-KEEP = 8                 # prompt states (one token before each end) a concurrent decoder keeps to resume from
+KEEP = int(os.environ.get("TF_FLASH_KEEP", "8"))   # prompt states (one token before each end) a concurrent decoder
+                         # keeps to resume from (~115 MB each for Flash Next, in the admission); TF_FLASH_KEEP sets it
 # Reserve bounded tower workspace separately from its weights; override for measured deployments.
 VISION_WORKSPACE = 4 * 2**30
 

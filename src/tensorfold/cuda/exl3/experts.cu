@@ -20,21 +20,28 @@ constexpr int GROUP_PER_THREAD = 4;
 __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
                                                               int* __restrict__ ucount, int* __restrict__ members,
                                                               int R, int slots, int E, int maxm) {
-    extern __shared__ int sh_pick[];
+    // counts by a shared histogram, then one warp lists the members in pick order, 32 picks a step (local patch
+    // 0105: the same lists as scanning every pick per expert, in O(picks) instead of O(experts * picks))
+    extern __shared__ int sh_pick[];                            // n picks, then E counts and E list numbers
     __shared__ int warp_tot[GROUP_THREADS / 32];
     const int n = R * slots;
+    int* sh_cnt = sh_pick + n;                                  // per expert: count, then members listed so far
+    int* sh_place = sh_cnt + E;                                 // per expert: its list
+    for (int e = threadIdx.x; e < E; e += GROUP_THREADS) sh_cnt[e] = 0;
     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) {
+        const int e = sh_pick[i];
+        if (e >= 0 && e < E) atomicAdd(&sh_cnt[e], 1);
+    }
     __syncthreads();
     int cnt[GROUP_PER_THREAD];
     int used = 0;
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
         const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        int c = 0;
-        if (e < E)
-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
-        cnt[q] = c;
-        used += c > 0;
+        cnt[q] = e < E ? sh_cnt[e] : 0;
+        used += cnt[q] > 0;
     }
     // exclusive scan of `used` over threads
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -61,14 +68,29 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     int place = warp_tot[warp] + inc - used;
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        if (cnt[q] == 0) continue;
         const int e = threadIdx.x * GROUP_PER_THREAD + q;
+        if (e < E) sh_cnt[e] = 0;
+        if (cnt[q] == 0) continue;
         uids[place] = e;
-        int j = 0;
-        for (int i = 0; i < n && j < maxm; ++i)
-            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
-        for (; j < maxm; ++j) members[place * maxm + j] = -1;
+        sh_place[e] = place;
+        for (int j = min(cnt[q], maxm); j < maxm; ++j) members[place * maxm + j] = -1;
         ++place;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int base = 0; base < n; base += 32) {
+            const int i = base + lane;
+            const int e = i < n ? sh_pick[i] : -1;
+            const bool ok = e >= 0 && e < E;
+            const unsigned same = __match_any_sync(0xffffffffu, ok ? e : -1);
+            if (ok) {
+                const int j = sh_cnt[e] + __popc(same & ((1u << lane) - 1u));
+                if (j < maxm) members[sh_place[e] * maxm + j] = (i / slots) * 32 + (i % slots);
+            }
+            __syncwarp();
+            if (ok && lane == __ffs(same) - 1) sh_cnt[e] += __popc(same);
+            __syncwarp();
+        }
     }
 }
 
@@ -406,7 +428,7 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
                       int64_t slots, int64_t E) {
     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
-    const size_t smem = (size_t)R * slots * sizeof(int);
+    const size_t smem = ((size_t)R * slots + 2 * (size_t)E) * sizeof(int);
     constexpr size_t static_smem = GROUP_THREADS / 32 * sizeof(int);
     if (smem + static_smem > 48 * 1024) {
         cudaFuncAttributes attributes;

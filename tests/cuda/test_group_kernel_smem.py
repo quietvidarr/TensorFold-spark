@@ -80,7 +80,7 @@ def _launch(rows, slots=SLOTS, device="cuda"):
 
 def test_device_limit_allows_more_than_a_hardcoded_96_kib_when_available():
     limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin - 128
-    rows = limit // (SLOTS * 4)
+    rows = (limit - 2 * EXPERTS * 4) // (SLOTS * 4)          # local 0105: the picks plus two ints an expert
     if rows * SLOTS * 4 <= 96 * 1024:
         pytest.skip("this device has no grouping launch between 96 KiB and its opt-in limit")
     _launch(rows)

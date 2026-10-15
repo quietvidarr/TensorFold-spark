@@ -29,13 +29,39 @@ def solo(w, st, capacity, depth, pbuf):
 
 
 class Alone:
+    # local patch 0009: a slot that stops being the graph slot keeps its graphs here (slot id -> (slot, capacity,
+    # graphs)) and gets them back when it is the graph slot again with the same buffers: switching the graph slot
+    # between conversations no longer recaptures every window shape (~20 captures, ~2.5 s of slow rounds a switch)
+    _graph_sets: dict | None = None
+
     def _state_changed(self, st) -> None:
         """Drop graphs before reallocating a slot: graph pointers must never outlive its cache geometry."""
 
-        if not self.planning and self.solo is not None and st is self.solo.st:
+        if self.planning or self.solo is None:
+            return
+        if self._graph_sets:
+            self._graph_sets.pop(id(st), None)            # a slot's kept graphs point at the buffers about to go
+        if st is self.solo.st:
             from .graphs import Graphs
 
             self.solo.graphs = Graphs(self.solo, max_rows=self.solo.rows)
+
+    def _point_solo(self, st) -> None:
+        """Make ``st`` the graph slot; the previous one keeps its graphs, ``st`` takes back its own if its buffers are unchanged."""
+
+        from .graphs import Graphs
+
+        prev = self.solo.st
+        if prev is st:
+            return
+        sets = self._graph_sets if self._graph_sets is not None else {}
+        self._graph_sets = sets
+        if getattr(self.solo, "graphs", None) is not None:
+            sets[id(prev)] = (prev, prev.capacity, self.solo.graphs)
+        self.solo.st = st
+        got = sets.pop(id(st), None)
+        same = got is not None and got[0] is st and got[1] == st.capacity
+        self.solo.graphs = got[2] if same else Graphs(self.solo, max_rows=self.solo.rows)
 
     def _flush(self, s) -> None:
         """Materialize the shared round's deferred recurrent rows before a graph reads or copies the slot."""
@@ -70,6 +96,7 @@ class Alone:
             need = spare.cache_bytes(size) - spare.cache_bytes() + spare.layer_bytes(size)
             if not self.memory_gate.fits(need):
                 return False
+            self._state_changed(spare)
             self.memory_gate.take(spare.resize(size))
         spare.copy_from(target)
         self.free = [f for f in self.free if f is not spare]
@@ -84,11 +111,11 @@ class Alone:
         target, old = self.solo.st, s.st
         self._flush(s)
         if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old):
-            self.solo.st = old                   # preserve both prefix chains instead of evicting a kept slot
-            if self.planning:
+            if self.planning:                    # preserve both prefix chains instead of evicting a kept slot
+                self.solo.st = old
                 self.actions.append(["solo", self._index(old)])
             else:
-                self._state_changed(old)
+                self._point_solo(old)
             return
         self._drop_kept(target)
         self.free = [f for f in self.free if f is not target]

@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
 
 MIN_GAP = 256            # a snapshot this close to the prompt start or to the previous snapshot saves too little
+# local patch 0006: also keep states at the last LAST message starts. A client that changes a recent message when it
+# sends the next turn (e.g. one that adds recalled memories to the newest user message and leaves them out of the history)
+# then resumes from that message's start instead of from the system prompt. 0: upstream's two points.
+# local patch 0010: TF_POINTS_LAST=all keeps a state at EVERY message start (a fork, a regenerate or an edit at message
+# k resumes at k's start). MIN_GAP still applies: of two starts closer than it the earlier one stays, so a resume
+# point is never more than MIN_GAP tokens before any message start.
+_last = os.environ.get("TF_POINTS_LAST", "0").strip().lower()
+LAST = -1 if _last in ("all", "-1") else int(_last or 0)
+# With ``all``, starts before a prompt's last 3 are kept only TF_POINTS_GAP tokens apart (default MIN_GAP: every one).
+# Each kept point splits the prefill (about one more pass over the weights), so a long history arriving at once (an
+# imported or edited chat) pays per point; a chat built turn by turn meets its new starts as its last ones anyway.
+GAP = max(MIN_GAP, int(os.environ.get("TF_POINTS_GAP", "0") or 0))
 
 
 class TemplateTokens:
@@ -31,12 +44,23 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callabl
     from tensorfold.engine.prefill_plan import PrefillPlan
 
     plan = PrefillPlan(openers=openers, assistant=assistant, min_chunk=max(MIN_GAP, len(assistant)))
+    from . import keep_rank
+    keep_rank.OPENERS = np.asarray(sorted(set(int(o) for o in openers)), dtype=np.int64)
 
     def points(ids: Sequence[int]) -> list[int]:
         arr = np.asarray(ids, dtype=np.int64)
         found = plan.points(arr)
         starts = np.flatnonzero(np.isin(arr, plan.openers)) if plan.openers else []
         wanted = ([int(starts[1])] if len(starts) > 1 else []) + ([found[-1]] if found else [])
+        if LAST < 0:
+            last = -GAP
+            for p in starts[1:-3]:
+                if p - last >= GAP:
+                    wanted.append(int(p))
+                    last = int(p)
+            wanted += [int(p) for p in starts[1:][-3:]]
+        elif LAST > 0:
+            wanted += [int(p) for p in starts[1:][-LAST:]]
         out: list[int] = []
         for p in sorted(set(wanted)):
             if MIN_GAP <= p < len(arr) and (not out or p - out[-1] >= MIN_GAP):

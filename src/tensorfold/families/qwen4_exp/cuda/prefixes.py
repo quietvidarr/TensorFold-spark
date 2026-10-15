@@ -1,5 +1,27 @@
 """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
 
+from tensorfold.cuda import keep_rank
+
+
+def _ranks(owner) -> list[int]:
+    """``keep_rank`` ranks of ``owner.kept`` (patch 0010): history points first, shared starting points last."""
+
+    conts = getattr(owner, "conts", None) or {}
+    waiting = getattr(owner, "unsaved", None) or ()
+    return keep_rank.ranks([k[0] for k in owner.kept], [len(conts.get(keep_rank.point_key(k[0]), ())) for k in owner.kept],
+                           [any(u[2] is k[1] and len(u[1]) == len(k[0]) for u in waiting) for k in owner.kept])
+
+
+def slot_order(owner) -> list:
+    """The kept slots, the one to free first first: its best point's rank lowest, then its oldest point oldest."""
+
+    r = _ranks(owner)
+    best: dict[int, tuple] = {}
+    for i, k in enumerate(owner.kept):
+        old = best.get(id(k[1]))
+        best[id(k[1])] = (max(r[i], old[0]), min(i, old[1]), k[1]) if old else (r[i], i, k[1])
+    return [v[2] for v in sorted(best.values(), key=lambda v: (v[0], v[1]))]
+
 
 def _best(kept, prompt, busy=(), cache_key=None):
     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
@@ -54,7 +76,12 @@ def remember(owner, ids, st, snap, tail) -> None:
     gone = [k[1] for k in owner.kept if same(k)]
     owner.kept = [k for k in owner.kept if not same(k)] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:
-        gone.append(owner.kept.pop(0)[1])
+        # Over the cap (patch 0010, ``keep_rank``): a point inside a conversation's history goes first (it is on disk),
+        # then a conversation's newest point, then a shared starting point (a reused system prompt, a fork's base);
+        # the oldest first within each, and a point not yet copied for the disk last of all.
+        r = _ranks(owner)
+        at = min(range(len(owner.kept)), key=lambda i: (r[i], i))
+        gone.append(owner.kept.pop(at)[1])
     busy = owner._busy()
     for old in gone:
         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \

@@ -200,6 +200,19 @@ __device__ __forceinline__ void prefill_strip(char* sm, const half* __restrict__
                 for (int l = 0; l < LW; ++l) w[l] = (l * 32 + lane < TW) ? tile[l * 32 + lane] : 0u;
                 decode_tile<CB, K2>(w, map, lane, bf[i][0], bf[i][1]);
             }
+            if (active == MTW) {                        // a full pass (most): every fragment loaded first, no branch
+                uint32_t a[MTW][4];
+#pragma unroll
+                for (int mt = 0; mt < MTW; ++mt) ldmatrix_a(a[mt], A + mt * 16 * L::LD + kk * 16, L::LD, lane);
+#pragma unroll
+                for (int mt = 0; mt < MTW; ++mt)
+#pragma unroll
+                    for (int i = 0; i < NTW; ++i) {
+                        mma16816_pure(acc[mt][i][0], a[mt], bf[i][0]);
+                        mma16816_pure(acc[mt][i][1], a[mt], bf[i][1]);
+                    }
+                continue;
+            }
 #pragma unroll
             for (int mt = 0; mt < MTW; ++mt) {
                 if (mt >= active) break;

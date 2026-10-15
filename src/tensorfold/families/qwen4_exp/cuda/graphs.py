@@ -39,7 +39,12 @@ class Graphs:
         return g
 
     def _bucket(self, end: int) -> int:
-        return min(self.e.st.capacity, max(8192, 1 << (end - 1).bit_length()))
+        """The context a graph is captured for: the slot's whole capacity (local patch 0009). Upstream took powers of
+        two from 8192, so a conversation crossing 16k, 32k, 64k... captured every window shape again (~2.5 s of slow
+        rounds each); the attention kernels' cost follows the rows in use, not this bound (measured equal at 0.3k,
+        8.8k and 33k tokens)."""
+
+        return self.e.st.capacity
 
     @torch.no_grad()
     def forward(self, tokens) -> torch.Tensor:

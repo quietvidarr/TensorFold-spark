@@ -67,7 +67,9 @@ def test_actual_attention_callsite_bounds_short_request_launches(monkeypatch, al
 @pytest.mark.torch
 @pytest.mark.parametrize("mtp", [False, True])
 @pytest.mark.parametrize("rows", [1, 8])
-def test_actual_graph_calls_recapture_when_live_context_crosses_bucket(monkeypatch, allocations, mtp, rows):
+def test_actual_graph_calls_capture_once_across_live_context(monkeypatch, allocations, mtp, rows):
+    # local patch 0009: one graph per window shape at the slot's capacity (upstream recaptured per power-of-two
+    # context bucket, here 8192 then 16384)
     mod = importlib.import_module("tensorfold.families.qwen4_exp.cuda.graphs")
     captures, computes = [], []
     monkeypatch.setattr(mod, "stage", lambda w, b, windows: [(windows[0][0], 0, len(windows[0][1]))])
@@ -92,8 +94,8 @@ def test_actual_graph_calls_recapture_when_live_context_crosses_bucket(monkeypat
             obj.mtp_forward([1] * rows, None)
         else:
             obj.forward([1] * rows)
-    assert len(captures) == 2
-    assert set(computes) == {8192, 16384}
+    assert len(captures) == 1
+    assert set(computes) == {262151}
 
 
 @pytest.mark.torch

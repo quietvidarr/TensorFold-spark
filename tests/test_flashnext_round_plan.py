@@ -385,3 +385,23 @@ def test_planned_growth_counts_prior_copies_under_the_explicit_cap(monkeypatch):
     monkeypatch.setattr(multi_plan, "cuda_limit_bytes", lambda: 180000)
     assert not ready(d, {"actions": [["resize", 2, 1024, "alone"], ["resize", 1, 1024, "alone"]]})
     assert all(st.capacity == 256 and not st.operations for st in d.slots)
+
+
+def test_graph_slot_switch_keeps_each_slots_graphs():
+    """Local patch 0009: a slot that stops being the graph slot gets its graphs back unless it was reallocated."""
+
+    from types import SimpleNamespace
+    from tensorfold.families.qwen4_exp.cuda import multi_solo
+
+    a, b = SimpleNamespace(capacity=8192), SimpleNamespace(capacity=8192)
+    dec = multi_solo.Alone()
+    dec.planning = False
+    dec.solo = SimpleNamespace(st=a, rows=8, graphs="graphs of a")
+    dec._point_solo(b)
+    assert dec.solo.st is b and dec.solo.graphs not in ("graphs of a",)
+    dec.solo.graphs = "graphs of b"
+    dec._point_solo(a)
+    assert dec.solo.graphs == "graphs of a"                  # unchanged buffers: the same graphs
+    dec._state_changed(b)                                    # b reallocated while not the graph slot
+    dec._point_solo(b)
+    assert dec.solo.graphs not in ("graphs of a", "graphs of b")

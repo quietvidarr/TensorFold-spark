@@ -11,6 +11,7 @@ from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda import keep_rank
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
@@ -19,7 +20,7 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
                      entry_end, prefill_begin, tp_sample_rows)
-from . import attn_multi, gdn_multi, image_rows, prefixes, vision_prefix
+from . import attn_multi, disk_points, gdn_multi, image_rows, prefixes, vision_prefix
 from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
@@ -46,6 +47,10 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
 
 class MultiDecoder(TwoRanks, Alone, PromptPasses):
     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
+
+    store = None                     # the prompt store on disk (patch 0006); set by __init__ when it is on
+    unsaved = ()                     # patch 0010 (set by __init__): points waiting in their slot for the disk queue
+    conts = None                     # patch 0010 (set by __init__): point -> continuations resumed from it
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
@@ -90,11 +95,17 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        # kept points also go to disk and come back from it (TF_PROMPT_CACHE_DIR; one GPU)
+        self.store = disk_points.open_store(self) if w.comm is None else None
+        self.unsaved: list = []          # patch 0010: kept points waiting in their slot for room in the disk queue
+        self.conts: dict = {}            # patch 0010: point -> the continuations requests resumed it with
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
 
     def _drop_kept(self, st: State) -> None:
+        if self.unsaved:
+            disk_points.flush(self, st)          # patch 0010: its points waiting for the disk queue are copied first
         self.kept = [k for k in self.kept if k[1] is not st]
 
     def _grow(self, st: State, rows: int, *, alone: bool = False, protect: State | None = None) -> bool:
@@ -146,6 +157,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _shrink(self, st: State, *, release: bool = False, force: bool = False) -> None:
         """Return idle caches to the gate, retaining the graph slot unless memory or cleanup requires its release."""
 
+        if self.unsaved:
+            disk_points.flush(self, st)
         st.reset(self.w)
         if force or st.capacity > FIRST and (release or not self._is_solo(st)):
             self._state_changed(st)
@@ -155,7 +168,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
 
         busy = self._busy()
-        for ids, st, _, _ in self.kept:
+        for st in prefixes.slot_order(self):     # patch 0010: history points' slots first, shared starting points last
             if st is not keep and st is not protect and id(st) not in busy:
                 self._drop_kept(st)
                 self._shrink(st, release=True)
@@ -211,12 +224,35 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
         if self.solo is not None and any(st is self.solo.st for st in self.free):
             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
-        return prefixes.slot_for(self, prompt, reuse, cache_key=cache_key)
+        store = self.store if reuse and cache_key is None and not self.planning else None
+        if self.unsaved and not self.planning:
+            for st in list(self.free):           # a free slot is reused next: its waiting points are copied now
+                disk_points.flush(self, st)
+        if store is not None:
+            disk_points.restore(self, prompt, prefixes._best(self.kept, prompt))
+        got = prefixes.slot_for(self, prompt, reuse, cache_key=cache_key)
+        if self.unsaved and not self.planning:
+            disk_points.flush(self, got[0], got[1] is not None and got[2] or 0)   # rows past the resume get rewritten
+        if got[2] and not self.planning and self.conts is not None:
+            keep_rank.note(self.conts, prompt, got[2], [k[0] for k in self.kept])
+        if store is not None and got[2]:
+            store.used(store.prefix(prompt), got[2])
+        return got
 
     def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
         if getattr(st, "vision_cache_key", None) is not None:
             snap = {**snap, **vision_prefix.snapshot_metadata(st)}
+        if self.store is not None and snap.get("vision_cache_key") is None and not self.planning:
+            try:
+                disk_points.capture(self, ids, st, snap, tail)
+            except Exception as exc:  # noqa: BLE001 - the disk copy never stops a request
+                self.store.stats["errors"] += 1
+                print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
         prefixes.remember(self, ids, st, snap, tail)
+        if self.unsaved and not self.planning:
+            for f in list(self.free):            # dropped from the kept points: copied before the slot is reused
+                disk_points.flush(self, f)
+            disk_points.retry(self)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
@@ -226,6 +262,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         """Warm a full prompt chunk, a cut partial chunk, drafts and a shared round, then discard their state."""
 
         self.solo_on = False
+        store, self.store = self.store, None             # the warm-up prompt's points stay off the disk
         try:
             s = Stream([0] * min(self.prefill_rows + WARM_TAIL + 1, self.capacity - self.depth - 2), 2)
             self.admit(s)
@@ -238,6 +275,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                 self.free.append(s.st)
         finally:
             self.solo_on = self.solo is not None
+            self.store = store
         if self.solo is not None:                    # last: the graph slot's rows are the ones requests will find
             self.solo.graphs.warm(self.depth + 1)
             self.solo.st.reset(self.w)               # the captures wrote its state
@@ -310,6 +348,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         else:
             ended, solo_sid = self._make_room(), None
             self.pass_plan = self.mixed_plan = None
+        if self.unsaved and not self.planning:
+            disk_points.retry(self)              # patch 0010: as soon as the disk queue has room
         live = [s for s in self.streams.values() if not s.done and not s.waiting]
         if self.filling and (not live or not self.converged):
             ended += self._fill()                      # passes alone; a prompt that ends here joins this round
@@ -524,6 +564,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
                 self._shrink(s.st)
                 self.free.append(s.st)
+        if self.unsaved and not self.streams and not self.filling and not self.planning:
+            disk_points.retry(self, force=True)  # patch 0010: idle: nothing to stall, every waiting point is copied
 
     def drop(self) -> list[Stream]:
         if self.link is not None:
