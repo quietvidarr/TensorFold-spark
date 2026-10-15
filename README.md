@@ -3,11 +3,6 @@
 > resume points at every message start, and bit-exact resume. All credit for TensorFold itself goes to
 > [ashhart/TensorFold](https://github.com/ashhart/TensorFold). What changed: [CHANGES.md](CHANGES.md).
 
-# TensorFold (Spark fork)
-
-Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) 0.6.5 (`609ca419`), Apache-2.0. All credit for TensorFold goes to its authors.
-Branch `spark` adds patches for EXL3 Qwen3.8 Flash Next and Qwen3.6-35B-A3B on a DGX Spark. See [CHANGES.md](CHANGES.md).
-
 # TensorFold
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
