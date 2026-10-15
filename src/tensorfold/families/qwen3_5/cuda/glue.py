@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorfold.cuda.exl3.prefill import rot128
+
 
 @triton.jit
 def _add_rmsnorm(X, R, W, H, Y, XS, eps, D: tl.constexpr, BLOCK: tl.constexpr, HAS_R: tl.constexpr):
@@ -212,6 +214,60 @@ def attn_prep(qg: torch.Tensor, k: torch.Tensor, q_norm: torch.Tensor, k_norm: t
                                       D=head_dim, HALF=inv_freq.numel(), MROPE=multi, ROWS=W if multi else 0,
                                       HSEC=mrope_section[1], WSEC=mrope_section[2], num_warps=2)
     return qo, ko
+
+
+@triton.jit
+def _gated_norm_rot(Yr, Z, W, SUH, XH, eps, VH: tl.constexpr, DV: tl.constexpr):
+    """_gated_norm's bf16 value, then rot_in's rotation for the next projection (suh, H128): fp16 into XH."""
+
+    row = tl.program_id(0)
+    h = tl.program_id(1)
+    offs = (row * VH + h) * DV + tl.arange(0, DV)
+    y = tl.load(Yr + offs).to(tl.float32)
+    z = tl.load(Z + offs).to(tl.float32)
+    w = tl.load(W + tl.arange(0, DV)).to(tl.float32)
+    yn = y * (1.0 / tl.sqrt(tl.sum(y * y, axis=0) / DV + eps)) * w
+    out = (z * tl.sigmoid(z) * yn).to(tl.bfloat16)
+    v = out.to(tl.float32) * tl.load(SUH + h * DV + tl.arange(0, DV)).to(tl.float32)
+    tl.store(XH + offs, tl.reshape(rot128(tl.reshape(v, (1, DV)), 1), (DV,)))
+
+
+def gated_norm_rot(y: torch.Tensor, z: torch.Tensor, w: torch.Tensor, eps: float, suh: torch.Tensor,
+                   xh: torch.Tensor) -> bool:
+    """gated_norm's output rotated for an EXL3 projection with ``suh`` straight into ``xh`` [W, VH*DV] fp16
+    (rot_in's bits: ``prefill.matmul(..., xh=xh)``); False when the head width is not 128."""
+
+    W, vh, dv = y.shape
+    if dv != 128 or xh.shape != (W, vh * dv) or not xh.is_contiguous() or suh.numel() != vh * dv:
+        return False
+    _gated_norm_rot[(W, vh)](y, z, w, suh, xh, eps, VH=vh, DV=dv, num_warps=1)
+    return True
+
+
+@triton.jit
+def _gate_mul_rot(O, QG, SUH, XH, H: tl.constexpr, D: tl.constexpr):
+    """_gate_mul's bf16 value, then rot_in's rotation (D / 128 blocks a head) into XH."""
+
+    row = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, D)
+    o = tl.load(O + (row * H + h) * D + d).to(tl.float32)
+    g = tl.load(QG + (row * H + h) * 2 * D + D + d).to(tl.float32)
+    out = (o * tl.sigmoid(g)).to(tl.bfloat16)
+    v = out.to(tl.float32) * tl.load(SUH + h * D + d).to(tl.float32)
+    r = rot128(tl.reshape(v, (D // 128, 128)), D // 128)
+    tl.store(XH + (row * H + h) * D + d, tl.reshape(r, (D,)))
+
+
+def gate_mul_rot(o: torch.Tensor, qg: torch.Tensor, suh: torch.Tensor, xh: torch.Tensor, *, heads: int,
+                 head_dim: int) -> bool:
+    """gate_mul's output rotated for an EXL3 projection with ``suh`` straight into ``xh`` (rot_in's bits)."""
+
+    W = o.shape[0]
+    if head_dim % 128 or xh.shape != (W, heads * head_dim) or not xh.is_contiguous() or suh.numel() != heads * head_dim:
+        return False
+    _gate_mul_rot[(W, heads)](o, qg, suh, xh, H=heads, D=head_dim, num_warps=2)
+    return True
 
 
 @triton.jit

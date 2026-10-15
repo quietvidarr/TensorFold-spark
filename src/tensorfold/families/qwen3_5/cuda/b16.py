@@ -46,5 +46,25 @@ def prompt_pair(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor) -> list[tor
     """Prompt rows times two weights in one launch, each ``prompt``'s bits."""
 
     if w0.dtype != torch.bfloat16 or w1.dtype != torch.bfloat16 or x.shape[1] % 64:
+        if w0.dtype == w1.dtype == torch.float16 and x.shape[0] >= 64 and x.shape[1] % 64 == 0 and x.stride(1) == 1:
+            return [_prompt_f16(x, w0), _prompt_f16(x, w1)]
         return [prompt(x, w0), prompt(x, w1)]
     return _ext().b16_prompt_pair(x.to(torch.bfloat16).contiguous(), w0.contiguous(), w1.contiguous(), 0)
+
+
+def _prompt_f16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Prompt rows x [M, K] (bf16 or fp16) @ fp16 w [N, K]^T on the fp16 mma (x rounded to fp16 in the kernel, as
+    matmul's cast does), fp16 out: fixed tiles and one K order a row, so a row never depends on its chunk (an EXL3
+    pack's GDN gates: one pass over x instead of a cast copy and a warp-per-output launch)."""
+
+    import triton
+
+    from tensorfold.families.qwen4_exp.cuda.exl3_mm import _f16_mm
+
+    m, k = x.shape
+    n = w.shape[0]
+    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    bn = 32 if n <= 32 else 64
+    _f16_mm[(triton.cdiv(m, 32), triton.cdiv(n, bn), 1)](x, w.contiguous(), out, m, n, x.stride(0), n, K=k, KS=k,
+                                                         BM=32, BN=bn, BK=64, F32=False, num_warps=4, num_stages=4)
+    return out

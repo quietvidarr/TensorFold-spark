@@ -1,5 +1,6 @@
-"""The EXL3 prompt-window expert kernel (``routed(..., prompt=True)``) against the grouped decode kernel: the same
-outputs to fp32 rounding, every member present, a row's result independent of the window it is in."""
+"""The EXL3 prompt-window expert kernel (``routed(..., prompt=True)``) against the grouped decode kernel and the exact
+(fp64) result: as close to the exact result as the grouped kernel, every member present, a row's result independent of
+the window it is in (each slot's y; the summed output in the deterministic modes of TF_EXL3_PROMPT_DET)."""
 
 import pytest
 import torch
@@ -28,7 +29,37 @@ def _picks(R, E, top, g, shared=True):
     return routed.contiguous()
 
 
-@pytest.mark.parametrize("R,k2s", [(64, [8]), (700, [8]), (2048, [8]), (300, [6, 8, 12, 16])])
+def _hadamard(v):
+    """The orthonormal H128 on the last dim in 128 blocks (fp64)."""
+
+    h = torch.ones((1, 1), dtype=torch.float64, device=v.device)
+    while h.shape[0] < 128:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    sh = v.shape
+    return (v.reshape(-1, 128) @ (h / 128 ** 0.5)).reshape(sh)
+
+
+def reference(ex, x, pick):
+    """Every slot's y [R, slots, D] in fp64 from the dequantized trellises (no fp16 roundings), 0 where a slot picks
+    no routed expert."""
+
+    R, slots = pick.shape
+    E = ex.count
+    y = torch.zeros((R, slots, ex.dims), dtype=torch.float64, device=x.device)
+    xf = x.double()
+    for e in torch.unique(pick).tolist():
+        if not 0 <= e < E:
+            continue
+        rr, kk = (pick == e).nonzero(as_tuple=True)
+        w = [X.dequant(ex.keep[j * E + e], ex.cb).double() for j in range(3)]
+        g = _hadamard(_hadamard(xf[rr] * ex.suh_g[e].double()) @ w[0]) * ex.svh_g[e].double()
+        u = _hadamard(_hadamard(xf[rr] * ex.suh_u[e].double()) @ w[1]) * ex.svh_u[e].double()
+        a = g * torch.sigmoid(g) * u
+        y[rr, kk] = _hadamard(_hadamard(a * ex.suh_d[e].double()) @ w[2]) * ex.svh_d[e].double()
+    return y
+
+
+@pytest.mark.parametrize("R,k2s", [(64, [8]), (700, [8]), (2048, [8]), (300, [6, 8, 12, 16]), (900, [8, 12])])
 def test_prompt_matches_grouped(R, k2s):
     E, D, I, top = 129, 2560, 640, 10
     ex, g = _layer(E, D, I, k2s)
@@ -39,12 +70,15 @@ def test_prompt_matches_grouped(R, k2s):
     ref = X.routed(x, pick, None, ex, s, None, R).clone()
     got = X.routed(x, pick, None, ex, s, None, R, prompt=True).clone()
     assert not torch.isnan(got).any()
-    # the K sums agree to fp32 rounding; the gate/up epilogue then rounds to fp16 (half an fp16 ulp is 2.4e-4 of
-    # the value), so an output moves by about that much where a sum lands near a rounding boundary
+    # both kernels round the rotated inputs and the gate/up epilogue's output to fp16 (half an fp16 ulp is 2.4e-4 of
+    # the value); the second-generation prompt kernel (lab patch 0201: other sum orders, tensor-core rotation) is
+    # not bit-identical to the grouped one but as close to the exact result
     err = (got - ref).abs().max() / ref.abs().max()
     assert err < 2e-3, f"prompt kernel off by {err:.2e}"
-    rel = ((got - ref).norm() / ref.norm()).item()
-    assert rel < 1e-4, f"prompt kernel off by {rel:.2e} (norm)"
+    exact = reference(ex, x, pick).view(R * slots, D)
+    e_prompt = ((got.double() - exact).norm() / exact.norm()).item()
+    e_grouped = ((ref.double() - exact).norm() / exact.norm()).item()
+    assert e_prompt < 1.05 * e_grouped + 1e-6, f"prompt kernel {e_prompt:.3e} vs grouped {e_grouped:.3e} from exact"
 
 
 def test_prompt_rows_independent_of_window():
@@ -69,12 +103,20 @@ def test_prompt_summed_is_the_weighted_slot_sum():
     x = (0.5 * torch.randn((R, D), device="cuda", generator=g)).bfloat16()
     s = X.Scratch(ex, R, top + 1)
     y = X.routed(x, pick, None, ex, s, None, R, prompt=True).clone().view(R, top + 1, D)
-    out = torch.empty((R, D), dtype=torch.float32, device="cuda")
-    X.routed(x, pick, wts, ex, s, out, R, prompt=True, summed=True)
     ref = torch.zeros((R, D), dtype=torch.float32, device="cuda")
     for k in range(top + 1):                          # slots in order, fp32, as the write-back sums them
         ref = torch.addcmul(ref, y[:, k], wts[:, k:k + 1])
-    assert ((out - ref).abs().max() / ref.abs().max()).item() < 1e-6
+    det = X.PROMPT_DET
+    try:
+        # "y": the slot sum itself; "grid" (default): each term rounded to its row's grid (<= 2^-24 of a bound on the
+        # row's sum of |terms|, so a few 1e-6 of the largest output)
+        for mode, tol in (("y", 1e-6), ("grid", 2e-5)):
+            X.PROMPT_DET = mode
+            out = torch.empty((R, D), dtype=torch.float32, device="cuda")
+            X.routed(x, pick, wts, ex, s, out, R, prompt=True, summed=True)
+            assert ((out - ref).abs().max() / ref.abs().max()).item() < tol, mode
+    finally:
+        X.PROMPT_DET = det
 
 
 def test_f16_prompt_path_matches_chunked():
@@ -144,3 +186,41 @@ def test_upmix_f16_matches_up_then_mix():
     assert diff.max().item() <= 2 * mixed_ref.float().abs().max().item() * 2 ** -8
     assert (diff > 0).float().mean().item() < 0.01
     assert torch.allclose(xs, xs_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_summed_window_and_determinism():
+    """TF_EXL3_PROMPT_DET: "0" (plain red.add, the slots' order free), "grid" (the default: terms on each row's grid,
+    exact adds) and "y" (each slot's y, fixed-order sum) agree within fp32 rounding (grid within its 2^-24 of the row
+    bound); grid and y are bit for bit independent of the window and repeatable, also with ``out`` a view of the
+    scratch's y (as Flash passes it)."""
+    E, D, I, top = 129, 2560, 640, 10
+    ex, g = _layer(E, D, I, [8, 12])
+    assert X.prompt2_fits(ex)
+    R = 600
+    pick = _picks(R, E, top, g)
+    wts = torch.rand((R, top + 1), device="cuda", generator=g)
+    x = (0.5 * torch.randn((R, D), device="cuda", generator=g)).bfloat16()
+    s = X.Scratch(ex, R, top + 1)
+    det = X.PROMPT_DET
+    got = {}
+    try:
+        for mode in ("0", "y", "grid"):
+            X.PROMPT_DET = mode
+            fixed = torch.empty((R, D), dtype=torch.float32, device="cuda")
+            X.routed(x, pick, wts, ex, s, fixed, R, prompt=True, summed=True)
+            got[mode] = fixed
+            if mode == "0":
+                continue
+            part = torch.empty((250, D), dtype=torch.float32, device="cuda")
+            X.routed(x[200:450].contiguous(), pick[200:450].contiguous(), wts[200:450].contiguous(), ex, s, part, 250,
+                     prompt=True, summed=True)
+            assert torch.equal(fixed[200:450], part)
+            alias = s.y[:R]                           # Flash passes out as a view of the scratch's y
+            X.routed(x, pick, wts, ex, s, alias, R, prompt=True, summed=True)
+            assert torch.equal(alias, fixed)
+    finally:
+        X.PROMPT_DET = det
+    ref = got["y"]
+    assert ((got["0"] - ref).abs().max() / ref.abs().max()).item() < 1e-6
+    assert ((got["grid"] - ref).abs().max() / ref.abs().max()).item() < 1e-5
+    assert ((got["grid"] - ref).norm() / ref.norm()).item() < 1e-5

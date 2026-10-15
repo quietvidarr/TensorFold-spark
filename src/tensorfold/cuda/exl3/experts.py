@@ -223,8 +223,143 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     return out
 
 
+@lru_cache(maxsize=1)
+def _ext2():
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_exl3_prompt_moe_v3", sources=[str(here / "prompt_moe.cpp"), str(here / "prompt_moe.cu")],
+                extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+
+
+# The prompt path's kernels: "2" (default) the second generation (prompt_moe.cuh: gate/up with its epilogue in one
+# launch, down with the slot sum in one), "1" the first (prefill_kernel and its epilogue kernels).
+# TF_EXL3_PROMPT_DET, the second generation's summed output (all deterministic but 0):
+#   1 (default) "grid": down adds each slot's term into out with fp32 red.add, every term first rounded to its row's
+#     power-of-two grid (a bound on the row's sums from the xd norms and each down matrix's largest column norm), so
+#     every addition is exact and the order cannot matter: bit-reproducible, a row's bits independent of the window,
+#     at the speed of the plain red.add; rounding <= 2^-24 of the row's bound (see row_grid_kernel).
+#   y: each slot's y [P, D] and a fixed-order slot sum (the first deterministic mode; ~1.3-1.5 ms a layer slower).
+#   0: plain fp32 red.add (the order of the additions, so out's last bits, varies from run to run).
+PROMPT_KERNEL = os.environ.get("TF_EXL3_PROMPT_KERNEL", "2")
+PROMPT_DET = os.environ.get("TF_EXL3_PROMPT_DET", "1").strip().lower()
+PROMPT_DET = {"0": "0", "fast": "0", "y": "y", "2": "y"}.get(PROMPT_DET, "grid")
+P2_K2 = (8, 12, 16)                    # trellis widths the second generation takes (4, 6 and 8 bits)
+OUT_BUDGET = int(os.environ.get("TF_EXL3_OUT_BUDGET", str(8 << 20)))   # bytes of out the down launch adds into at once
+
+
+def prompt2_fits(ex: Exl3RoutedExperts) -> bool:
+    """The second generation's shapes: D and I in 128-blocks, gate and up of an expert at one width, every width 4, 6
+    or 8 bits."""
+
+    ok = getattr(ex, "_p2_fits", None)
+    if ok is None:
+        widths = set(ex.gate_k2.tolist()) | set(ex.up_k2.tolist()) | set(ex.down_k2.tolist())
+        ok = (ex.dims % 128 == 0 and ex.width % 128 == 0 and bool(torch.equal(ex.gate_k2, ex.up_k2))
+              and widths <= set(P2_K2))
+        ex._p2_fits = ok
+    return ok
+
+
+_XDT: dict = {}
+
+
+def _xd_tiles(n: int, device) -> torch.Tensor:
+    """gate_up's output, per work item [n] fp16 (down's input in k16 slices), a buffer a device, grown on demand."""
+
+    buf = _XDT.get(device)
+    if buf is None or buf.numel() < n:
+        buf = _XDT[device] = torch.empty((n,), dtype=torch.float16, device=device)
+    return buf
+
+
+def down_colmax(ex: Exl3RoutedExperts, chunk: int = 32) -> torch.Tensor | None:
+    """[E] fp32: each expert's largest column norm of its down map xd -> y as the prompt kernel applies it
+    (W_q, then H128 a 128-column block, * svh / sqrt(128)); None when the trellises are not at hand. Computed once a
+    layer (prompt_moe.cu colmax_kernel: fixed order, the same bits every run) and kept on ``ex``; only an upper
+    bound is needed (row_grid_kernel adds 2^-6 for roundings)."""
+
+    got = getattr(ex, "_p2_colmax", False)
+    if got is not False:
+        return got
+    E, D, I = ex.count, ex.dims, ex.width
+    downs = ex.keep[2 * E:3 * E] if len(ex.keep) >= 3 * E else None      # prepare keeps gate, up, down (then extras)
+    if downs is None or any(t.shape[0] * 16 != I or t.shape[1] * 16 != D for t in downs):
+        ex._p2_colmax = None
+        return None
+    dev = ex.svh_d.device
+    sq = torch.empty((E, D // 128), dtype=torch.float32, device=dev)
+    buf = torch.empty((chunk, I, D), dtype=torch.float16, device=dev)
+    for e0 in range(0, E, chunk):
+        n = min(chunk, E - e0)
+        for j in range(n):
+            t = downs[e0 + j]
+            _ext().dequant(t.contiguous(), buf[j], k2_of(t), ex.cb)
+        _ext2().colmax(buf, ex.svh_d[e0:e0 + n].contiguous(), sq[e0:e0 + n], n, I, D)
+    cm = sq.amax(1).sqrt() * (1.0 / math.sqrt(128.0))
+    ex._p2_colmax = cm
+    return cm
+
+
+_NRM: dict = {}
+
+
+def _grid_bufs(P: int, G: int, R: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    nrm, grid = _NRM.get(device, (None, None))
+    if nrm is None or nrm.numel() < P * G or grid.numel() < R:
+        nrm = torch.empty((max(P * G, 1),), dtype=torch.float32, device=device)
+        grid = torch.empty((max(R, 1),), dtype=torch.float32, device=device)
+        _NRM[device] = (nrm, grid)
+    return nrm, grid
+
+
+def _routed_prompt2(x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, act_mode: int, ids,
+                    members, summed: bool) -> torch.Tensor:
+    ext, e2 = _ext(), _ext2()
+    D, I, E = ex.dims, ex.width, ex.count
+    slots = s.slots
+    P = R * slots
+    most = P // PREFILL_PASS + min(P, E)              # work items: passes of every expert's members
+    ext.group_any(pick, ids, s.count, members, s.counts, s.slot_of, s.work, R, slots, E, PREFILL_PASS)
+    items = torch.empty((most, 2), dtype=torch.int32, device=x.device)
+    e2.item_table(s.work, s.count, items, most)
+    cm = down_colmax(ex) if wts is not None and summed and PROMPT_DET == "grid" else None
+    exact = cm is not None                             # red.add of terms on each row's grid: deterministic
+    red = wts is not None and summed and (PROMPT_DET == "0" or exact)   # down adds each slot's w * y into out
+    if red and out is None:
+        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    e2.to_half(x, x.stride(0), s.xg, R, D, out if red else None)   # fp16(x * 2^-2) [R, D] in xg; out = 0
+    xd = _xd_tiles(most * PREFILL_PASS * I, x.device)
+    nrm, grid = _grid_bufs(P, I // 128, R, x.device) if exact else (None, None)
+    e2.gate_up(s.xg, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.suh_g, ex.suh_u, ex.svh_g, ex.svh_u, ex.suh_d, ids,
+               s.count, members, s.work, items, xd, D, I, P, slots, ex.cb, most, ex.k2_gu[1], float(limit), act_mode,
+               nrm)
+    if exact:
+        e2.row_grid(nrm, pick, wts, cm, grid, R, slots, E, I // 128)
+    if red:
+        e2.down(xd, ex.down_ptr, ex.down_k2, ex.svh_d, ids, s.count, members, s.work, items, wts, out, D, I, slots,
+                ex.cb, most, ex.k2_d[1], R, OUT_BUDGET, grid)
+        return out
+    # each slot's y; for the fixed-order sum in Z (free here), since a caller's out may be a view of s.y (Flash's is)
+    y = s.z[:P * D].view(P, D) if wts is not None and summed else s.y
+    e2.down(xd, ex.down_ptr, ex.down_k2, ex.svh_d, ids, s.count, members, s.work, items, None, y, D, I, slots, ex.cb,
+            most, ex.k2_d[1], R, 0, None)
+    if wts is None:
+        return s.y[:P]
+    if out is None:
+        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    if summed:
+        e2.slot_sum(y, pick, wts, out, R, D, slots, E)
+    else:
+        ext.combine(s.y, wts, out, R, D, slots)
+    return out
+
+
 def _routed_prompt(x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, act_mode: int, ids,
                    members, summed: bool = False) -> torch.Tensor:
+    if (PROMPT_KERNEL != "1" and prompt2_fits(ex) and x.stride(1) == 1 and x.stride(0) % 8 == 0
+            and x.data_ptr() % 16 == 0 and x.dtype in (torch.bfloat16, torch.float16)):
+        return _routed_prompt2(x, pick, wts, ex, s, out, R, limit, act_mode, ids, members, summed)
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
     slots = s.slots

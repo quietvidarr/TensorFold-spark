@@ -4,6 +4,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
@@ -146,7 +147,7 @@ __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
 template <typename QK, int ROWS>
 void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g, const at::Tensor& beta,
             const at::Tensor& state, at::Tensor& last, at::Tensor& y) {
-    constexpr int STEPS = 32;
+    constexpr int STEPS = ROWS >= 64 ? 32 : 16;     // 32-row blocks: a smaller stage, so 3+ blocks share an SM
     const int W = q.size(0), hk = q.size(1), hv = v.size(1);
     const dim3 grid(hv, DV / ROWS);
     chain_kernel<QK, ROWS, STEPS><<<grid, 2 * ROWS, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -158,15 +159,32 @@ void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const
 
 } // namespace
 
-// Fewer heads than SMs: a block takes 64 value rows, not 128, so the chunk still fills the GPU.
+// Value rows a block: the block size whose busiest SM gets the fewest rows (each value row is its own recurrence, so
+// every choice gives the same bits); ties keep the larger block. E.g. 32 heads on 48 SMs: 32-row blocks (96 rows an
+// SM at most) instead of 64 (128: a third of the SMs ran two blocks). TF_GDN_CHAIN_ROWS=128|64|32 overrides.
+static int chain_rows(int hv, int sms) {
+    if (const char* e = std::getenv("TF_GDN_CHAIN_ROWS")) {
+        const int r = std::atoi(e);
+        if (r == 128 || r == 64 || r == 32) return r;
+    }
+    int best = 128, load = 1 << 30;
+    for (int r : {128, 64, 32}) {
+        const int blocks = hv * (DV / r), l = ((blocks + sms - 1) / sms) * r;
+        if (l < load) { load = l; best = r; }
+    }
+    return best;
+}
+
 void gdn_prefill_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                       const at::Tensor& beta, const at::Tensor& state, at::Tensor& last, at::Tensor& y, int sms) {
-    const bool wide = v.size(1) >= sms;
+    const int rows = chain_rows((int)v.size(1), sms);
     if (q.scalar_type() == at::kFloat) {
-        if (wide) launch<float, 128>(q, k, v, g, beta, state, last, y);
-        else launch<float, 64>(q, k, v, g, beta, state, last, y);
+        if (rows == 128) launch<float, 128>(q, k, v, g, beta, state, last, y);
+        else if (rows == 64) launch<float, 64>(q, k, v, g, beta, state, last, y);
+        else launch<float, 32>(q, k, v, g, beta, state, last, y);
     } else {
-        if (wide) launch<__nv_bfloat16, 128>(q, k, v, g, beta, state, last, y);
-        else launch<__nv_bfloat16, 64>(q, k, v, g, beta, state, last, y);
+        if (rows == 128) launch<__nv_bfloat16, 128>(q, k, v, g, beta, state, last, y);
+        else if (rows == 64) launch<__nv_bfloat16, 64>(q, k, v, g, beta, state, last, y);
+        else launch<__nv_bfloat16, 32>(q, k, v, g, beta, state, last, y);
     }
 }

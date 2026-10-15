@@ -108,6 +108,20 @@ class Exl3:
         return matmul(self.layer, x, torch.empty((x.shape[0], self.n), dtype=torch.bfloat16, device=x.device),
                       self.workspace)
 
+    def prefill_rotated(self, rows: int, fill, device) -> torch.Tensor | None:
+        """``prefill`` of rows a producer writes already rotated: ``fill(suh, xh)`` fills the workspace's xh [rows, K]
+        fp16 with rot_in's bits and returns False when it cannot (then None: the caller takes ``prefill``)."""
+
+        from tensorfold.cuda.exl3.prefill import matmul, rotated_input
+
+        if self.workspace is None:
+            return None
+        xh = rotated_input(self.workspace, rows, self.k, device)
+        if not fill(self.layer.suh, xh):
+            return None
+        return matmul(self.layer, None, torch.empty((rows, self.n), dtype=torch.bfloat16, device=device),
+                      self.workspace, xh=xh)
+
 
 @dataclass
 class Config:

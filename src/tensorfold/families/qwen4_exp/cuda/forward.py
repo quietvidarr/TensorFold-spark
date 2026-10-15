@@ -59,6 +59,18 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
     # prompts, and an EXL3 pack's (its hyper-connection matrices are fp16), whose read-out then skips the norm
     if b.prefill and R > FUSED_ROWS and isinstance(hc.down, (qmm.Q4, F16)):
         fused = _hc_fuser(h.device)
+        if fused is not None and HC_ON_THE_FLY and _readout_on_the_fly(hc, b, h, R, streams):
+            # no normed rows: write-back and each stream's 1/rms, then down and up-mix normalize h on the fly
+            from .exl3_mm import f16_prefill_normed, upmix_f16_normed
+
+            rinv = _hc_rinv(b, streams)[:R]
+            fused(h[:R], b.pss[:R], hc.scale, None, None, streams, eps, mode, branch=branch, inject=inject_prev,
+                  y=y, wts=wts, rinv=rinv)
+            out = b.dn[:R] if hc.down.n == b.dn.shape[1] else b.dn_mix[:R]
+            f16_prefill_normed(hc.down, h[:R], rinv, hc.scale, streams, out)
+            glue.hc_act(out, b.act[:R], b.xs_act[:R], inject_out[:R] if hc.inject else None, streams, low)
+            upmix_f16_normed(b.act[:R], hc.up, h[:R], rinv, hc.scale, b.mixed[:R], b.xs_mixed[:R], streams)
+            return
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
                   branch=branch, inject=inject_prev, y=y, wts=wts)
@@ -69,6 +81,30 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
 
 
 FUSED_ROWS = 16      # decode windows: the read-out in 3 kernels; wider windows (prefill) in 5, the same bits
+# prompt pieces of an EXL3 pack (fp16 hyper-connection matrices): the read-out never writes the normed streams (the
+# down projection and the up-mix make them from h and the 1/rms write_norm stores; the same bits). TF_HC_ON_THE_FLY=0: off.
+HC_ON_THE_FLY = os.environ.get("TF_HC_ON_THE_FLY", "1") != "0"
+
+
+def _hc_rinv(b: Buffers, streams: int) -> torch.Tensor:
+    t = getattr(b, "hc_rinv", None)
+    if t is None:
+        t = b.hc_rinv = torch.empty((b.h.shape[0], streams), dtype=torch.float32, device=b.h.device)
+    return t
+
+
+def _readout_on_the_fly(hc: HC, b: Buffers, h: torch.Tensor, R: int, streams: int) -> bool:
+    """Whether ``hc_block``'s on-the-fly read-out takes this call (both matrices fp16, the prompt tiles' shapes)."""
+
+    from .exl3_mm import F16, ROWS, prompt_tiles
+
+    if not (isinstance(hc.down, F16) and isinstance(hc.up, F16) and R > ROWS and h.stride(1) == 1):
+        return False
+    wide = h.shape[1]
+    d = wide // streams
+    bk = prompt_tiles(hc.down.n, hc.down.k)[2]
+    return (hc.down.k == wide and d % bk == 0 and hc.up.n == wide and hc.up.k % 64 == 0 and d % 64 == 0
+            and hc.scale.numel() == wide and h.stride(0) == wide and hc.scale.is_contiguous())
 
 
 def _readout(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, streams: int, low: int, inject) -> None:
@@ -162,8 +198,13 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     if b.prefill:
         _mm(b.mixed[:R], g.proj, b.xs_mixed[:R], b.proj[0, :R], b)
         at = {cut.at: cut for cut in cuts}
+        rot = _rotated_out(w, g.out, R)        # an EXL3 out projection: back writes its rotated input
         for st, a0, a1 in segs:
-            _prefill_chain(g, st, li, b, a0, a1, c, at.get(a0))
+            _prefill_chain(g, st, li, b, a0, a1, c, at.get(a0), rot)
+        if rot is not None:
+            from tensorfold.cuda.exl3 import prefill as x3prefill
+
+            return 1, x3prefill.matmul(g.out.lin, None, b.branch[:R], g.out.sc.prefill, xh=rot[1])
         return _out_proj(w, b, b.gout[:R], g.out, b.gxs[:R], R)
     _mm(b.mixed[:R], g.proj, b.xs_mixed[:R], b.proj[li, :R], b)
     tables = getattr(b, "gdn_tables", None)           # a concurrent round: every stream in one launch a step
@@ -177,7 +218,31 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     return _out_proj(w, b, b.gout[:R], g.out, b.gxs[:R], R)
 
 
-def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None) -> None:
+def _rotated_out(w: Weights, out, R: int):
+    """(suh, xh [R, K]) when the GDN out projection is an EXL3 prompt GEMM on one GPU: gdn_io.back then writes its
+    rotated input (rot_in's bits) and the bf16 rows are never written; else None."""
+
+    from .exl3_mm import X3
+
+    if w.comm is not None or not isinstance(out, X3) or out.head or ROTATED_OUT is False:
+        return None
+    from tensorfold.cuda.exl3 import prefill as x3prefill
+
+    return out.lin.suh, x3prefill.rotated_input(out.sc.prefill, R, out.lin.k, out.lin.suh.device)
+
+
+ROTATED_OUT = os.environ.get("TF_GDN_ROTATED_OUT", "1") != "0"
+
+
+def _back(y, p, g, c, b: Buffers, a0: int, a1: int, rot) -> None:
+    if rot is None:
+        gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1])
+    else:
+        gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1], rot[0], rot[1][a0:a1])
+
+
+def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None,
+                   rot=None) -> None:
     """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row)."""
 
     n, p, cur = a1 - a0, b.proj[0, a0:a1], st.cur[li]
@@ -185,18 +250,18 @@ def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: 
     q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias, c.nk)
     if cut is None:
         y = shared_gdn.chain(q, k, v, gt, beta, st.rec[cur, li], st.rec[1 - cur, li])
-        gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1])
+        _back(y, p, g, c, b, a0, a1, rot)
     else:                                        # the rows before the kept point, its state, then the rest from it
         m, mid = cut.row, st.rec[1 - cur, li]
         y = shared_gdn.chain(q[:m], k[:m], v[:m], gt[:m], beta[:m], st.rec[cur, li], mid)
-        gdn_io.back(y, p[:m], g.norm, c.eps, b.gout[a0:a0 + m], b.gxs[a0:a0 + m])
+        _back(y, p[:m], g, c, b, a0, a0 + m, rot)
         if cut.rec is None:
             cut.rec, cut.conv = torch.empty_like(st.rec[0]), torch.empty_like(st.conv)
         cut.rec[li].copy_(mid)
         cut.conv[li].copy_(st.conv[li])
         shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + m], m, c.conv_dim)
         y = shared_gdn.chain(q[m:], k[m:], v[m:], gt[m:], beta[m:], mid, st.rec[cur, li])
-        gdn_io.back(y, p[m:], g.norm, c.eps, b.gout[a0 + m:a1], b.gxs[a0 + m:a1])
+        _back(y, p[m:], g, c, b, a0 + m, a1, rot)
         cur = 1 - cur                            # the second launch wrote the state back where the first read it
     st.cur[li] = 1 - cur
     shift_windows(st.conv[li:li + 1], b.proj[0:1, a0:a1], n, c.conv_dim)
@@ -271,6 +336,11 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
         if len(segs) > 1:                       # the scratch output is the next stream's too
             b.attn_o[a0:a1].copy_(o[:a1 - a0])
     o = b.attn_o if b.prefill or len(segs) > 1 else o
+    rot = _rotated_out(w, a.o, R) if b.prefill else None
+    if rot is not None and glue.attn_gate_rot(o[:R], b.pa[:R], rot[0], rot[1], q_heads=c.heads, head_dim=c.head_dim):
+        from tensorfold.cuda.exl3 import prefill as x3prefill
+
+        return 1, x3prefill.matmul(a.o.lin, None, b.branch[:R], a.o.sc.prefill, xh=rot[1])
     glue.attn_gate(o[:R], b.pa[:R], b.gated[:R], b.xs_gated[:R], q_heads=c.heads, head_dim=c.head_dim)
     return _out_proj(w, b, b.gated[:R], a.o, b.xs_gated[:R], R)
 

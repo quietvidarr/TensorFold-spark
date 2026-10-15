@@ -15,7 +15,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qwen4_exp_gdn_io", sources=[str(here / "gdn_io.cpp"), str(here / "gdn_io.cu")],
+    return load(name="tensorfold_qwen4_exp_gdn_io_v2", sources=[str(here / "gdn_io.cpp"), str(here / "gdn_io.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -35,7 +35,8 @@ def front(p: torch.Tensor, conv_ptrs: torch.Tensor, sid: torch.Tensor, windows: 
 
 
 def back(y: torch.Tensor, p: torch.Tensor, norm_w: torch.Tensor, eps: float, out: torch.Tensor,
-         xs: torch.Tensor) -> None:
-    """Gated RMSNorm of the read-out ``y`` (z from ``p``) into bf16 ``out`` and its 32-channel group sums ``xs``."""
+         xs: torch.Tensor, suh: torch.Tensor | None = None, xh: torch.Tensor | None = None) -> None:
+    """Gated RMSNorm of the read-out ``y`` (z from ``p``) into bf16 ``out`` and its 32-channel group sums ``xs``; with
+    ``suh`` and ``xh`` instead rotated for an EXL3 projection (rot_in's bits) into ``xh`` fp16."""
 
-    _ext().back(y, p, norm_w, float(eps), out, xs)
+    _ext().back(y, p, norm_w, float(eps), out, xs, suh, xh)

@@ -230,6 +230,98 @@ def upmix_f16(act: torch.Tensor, up: "F16", normed: torch.Tensor, mixed: torch.T
     return True
 
 
+@triton.jit(do_not_specialize=["M"])
+def _f16_mm_normed(H, RINV, SCALE, W, OUT, M, N, h_stride, o_stride, K: tl.constexpr, D: tl.constexpr,
+                   S: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """_f16_mm (one K slice) of the normed streams computed on the fly: x = bf16(h * rinv[stream] * scale), the
+    hyper-connection norm's exact bits, so the normed rows are never written. Programs n-block fastest: the
+    blocks of one row block read its streams together (from L2)."""
+
+    pid = tl.program_id(0)
+    nn = tl.cdiv(N, BN)
+    pm = pid // nn
+    pn = pid % nn
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    m_ok = rm < M
+    n_ok = rn < N
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        s = k0 // D
+        hv = tl.load(H + rm[:, None] * h_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+        ri = tl.load(RINV + rm * S + s, mask=m_ok, other=0.0)
+        sc = tl.load(SCALE + k0 + rk).to(tl.float32)
+        x = (hv * ri[:, None] * sc[None, :]).to(tl.bfloat16)
+        w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+        acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
+    tl.store(OUT + rm[:, None] * o_stride + rn[None, :], acc.to(OUT.dtype.element_ty),
+             mask=m_ok[:, None] & n_ok[None, :])
+
+
+def f16_prefill_normed(down: "F16", h: torch.Tensor, rinv: torch.Tensor, scale: torch.Tensor, streams: int,
+                       out: torch.Tensor, tiles=None) -> bool:
+    """``down.prefill(normed, out)`` with the normed rows made from h and the streams' 1/rms (write_norm's
+    ``rinv``), the same bits; False when the shapes do not fit (the caller writes normed and runs prefill)."""
+
+    m, k = h.shape
+    bm, bn, bk, stages, warps = tiles or (*prompt_tiles(down.n, down.k), 4)
+    d = k // streams
+    if (k != down.k or d % bk or m <= ROWS or out.stride(-1) != 1 or h.stride(1) != 1 or scale.numel() != k
+            or not rinv.is_contiguous() or rinv.shape[0] < m):
+        return False
+    grid = (triton.cdiv(m, bm) * triton.cdiv(down.n, bn),)
+    _f16_mm_normed[grid](h, rinv, scale, down.w, out, m, down.n, h.stride(0), out.stride(0), K=k, D=d, S=streams,
+                         BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages)
+    return True
+
+
+@triton.jit
+def _upmix_f16_normed(X, W, H, RINV, SCALE, MIXED, XS, M, x_stride, K: tl.constexpr, D: tl.constexpr,
+                      S: tl.constexpr, BM: tl.constexpr, BD: tl.constexpr, BK: tl.constexpr):
+    """_upmix_f16 with each stream's normed values made from h on the fly (write_norm's bits)."""
+
+    pm = tl.program_id(0)
+    pd = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    dd = pd * BD + tl.arange(0, BD)
+    rk = tl.arange(0, BK)
+    ok = rm < M
+    total = tl.zeros((BM, BD), dtype=tl.float32)
+    for s in tl.static_range(S):
+        acc = tl.zeros((BM, BD), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=ok[:, None], other=0.0)
+            w = tl.load(W + (s * D + dd)[:, None] * K + (k0 + rk)[None, :])
+            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
+        u = acc.to(tl.bfloat16).to(tl.float32)
+        hv = tl.load(H + rm[:, None] * (S * D) + s * D + dd[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+        ri = tl.load(RINV + rm * S + s, mask=ok, other=0.0)
+        sc = tl.load(SCALE + s * D + dd).to(tl.float32)
+        n = (hv * ri[:, None] * sc[None, :]).to(tl.bfloat16).to(tl.float32)
+        total += ((1.0 / (1.0 + tl.exp(-u))).to(tl.bfloat16).to(tl.float32) * n).to(tl.bfloat16).to(tl.float32)
+    m = (total / S).to(tl.bfloat16)
+    tl.store(MIXED + rm[:, None] * D + dd[None, :], m, mask=ok[:, None])
+    sums = tl.sum(tl.reshape(m.to(tl.float32), (BM, BD // 32, 32)), axis=2)
+    tl.store(XS + rm[:, None] * (D // 32) + pd * (BD // 32) + tl.arange(0, BD // 32)[None, :], sums,
+             mask=ok[:, None])
+
+
+def upmix_f16_normed(act: torch.Tensor, up: "F16", h: torch.Tensor, rinv: torch.Tensor, scale: torch.Tensor,
+                     mixed: torch.Tensor, xs: torch.Tensor, streams: int, tiles=None) -> bool:
+    """upmix_f16 with the normed streams made from h and their 1/rms (the same bits); False when it does not fit."""
+
+    m, k = act.shape
+    d = up.n // streams
+    bm, bd, bk, stages, warps = tiles or (64, 64, 64, 3, 4)
+    if (up.n != streams * d or k != up.k or k % bk or d % bd or act.stride(1) != 1 or h.shape[1] != up.n
+            or h.stride(1) != 1 or h.stride(0) != up.n or not mixed.is_contiguous() or scale.numel() != up.n):
+        return False
+    _upmix_f16_normed[(triton.cdiv(m, bm), d // bd)](act, up.w, h, rinv, scale, mixed, xs, m, act.stride(0), K=k, D=d,
+                                                     S=streams, BM=bm, BD=bd, BK=bk, num_warps=warps, num_stages=stages)
+    return True
+
+
 @dataclass
 class X3:
     """A trellis projection: the row-invariant EXL3 linear in 128-row calls, or the prompt GEMM (``prefill``)."""

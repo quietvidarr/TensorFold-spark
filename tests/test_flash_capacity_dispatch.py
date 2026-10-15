@@ -118,7 +118,7 @@ def test_prompt_blocks_bound_their_launches_by_their_own_rows(monkeypatch, alloc
     buffers = SimpleNamespace(attn=scratch, mixed=tensor, xs_mixed=tensor, pa=tensor, q=tensor, iq=tensor,
                               gated=tensor, xs_gated=tensor, attn_o=tensor, prefill=True,
                               pos_blk=SimpleNamespace(fill_=lambda v: None))
-    for name in ("_mm", "_out_proj"):
+    for name in ("_mm", "_out_proj", "_rotated_out"):          # _rotated_out: the EXL3 prompt path (patch 0204)
         monkeypatch.setattr(mod, name, lambda *a, **kw: None)
     for name in ("attn_prep", "attn_gate"):
         monkeypatch.setattr(mod.glue, name, lambda *a, **kw: None)

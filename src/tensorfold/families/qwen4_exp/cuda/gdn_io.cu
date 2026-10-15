@@ -3,6 +3,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace {
@@ -73,12 +74,28 @@ __global__ void __launch_bounds__(128) front_kernel(
     }
 }
 
-// Block (row, value head): gated RMSNorm on warp 0's sum as the chain kernel, then bf16 out and 32-channel group sums.
+// cuda/exl3 linear.cu's fwht128 (strides 1, 2 in registers, 4..64 across lanes), the same operations in the same order
+__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
+    float a = __fadd_rn(v[0], v[1]), b = __fsub_rn(v[0], v[1]), c = __fadd_rn(v[2], v[3]), d = __fsub_rn(v[2], v[3]);
+    v[0] = __fadd_rn(a, c); v[1] = __fadd_rn(b, d); v[2] = __fsub_rn(a, c); v[3] = __fsub_rn(b, d);
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? __fsub_rn(o, v[j]) : __fadd_rn(v[j], o);
+        }
+    }
+}
+
+// Block (row, value head): gated RMSNorm on warp 0's sum as the chain kernel, then bf16 out and 32-channel group sums;
+// with suh (an EXL3 out projection's prompt path) instead the head's 128 values rotated as rot_in does (x * suh, H128,
+// 1 / sqrt(128), fp16) into xh, the projection's rotated input.
 template <int NK, int NV>
 __global__ void __launch_bounds__(128) back_kernel(
         const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* __restrict__ P,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out,
-        float* __restrict__ xs) {
+        float* __restrict__ xs, const __half* __restrict__ suh, __half* __restrict__ xh) {
     constexpr int C = 2 * NK * DK + NV * DV, PW = C + NV * DV + 2 * NV;
     const int r = blockIdx.x, hv = blockIdx.y, t = threadIdx.x, warp = t >> 5, lane = t & 31;
     __shared__ float ys[DV];
@@ -96,6 +113,22 @@ __global__ void __launch_bounds__(128) back_kernel(
     const float yn = bf(bf(ys[t] * rinv) * __bfloat162float(norm_w[t]));
     const float z = __bfloat162float(P[(size_t)r * PW + C + hv * DV + t]);
     const float o = bf(yn * sigmoidf_(z));
+    if (suh) {
+        __syncthreads();                              // ys is free: the head's values for warp 0's rotation
+        ys[t] = o;
+        __syncthreads();
+        if (warp == 0) {
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = __fmul_rn(ys[4 * lane + j], __half2float(suh[hv * DV + 4 * lane + j]));
+            fwht128(v, lane);
+            __half h[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) h[j] = __float2half_rn(__fmul_rn(v[j], 0.08838834764831845f));
+            *reinterpret_cast<uint2*>(xh + (size_t)r * NV * DV + hv * DV + 4 * lane) = *reinterpret_cast<uint2*>(h);
+        }
+        return;
+    }
     out[(size_t)r * NV * DV + hv * DV + t] = __float2bfloat16_rn(o);
     const float gs = warp_sum(o);
     if (lane == 0) xs[(size_t)r * (NV * DV / 32) + hv * (DV / 32) + warp] = gs;
@@ -122,13 +155,14 @@ void gdn_front_cuda(const at::Tensor& P, const at::Tensor& conv_ptrs, const at::
 }
 
 void gdn_back_cuda(const at::Tensor& y, const at::Tensor& P, const at::Tensor& norm_w, double eps, at::Tensor& out,
-                   at::Tensor& xs) {
+                   at::Tensor& xs, const at::Tensor* suh, at::Tensor* xh) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int rows = (int)y.size(0), nv = (int)y.size(1);
     auto launch = [&](auto kernel) {
         kernel<<<dim3(rows, nv), 128, 0, stream>>>(
             (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)P.data_ptr(),
-            (const __nv_bfloat16*)norm_w.data_ptr(), (float)eps, (__nv_bfloat16*)out.data_ptr(), xs.data_ptr<float>());
+            (const __nv_bfloat16*)norm_w.data_ptr(), (float)eps, (__nv_bfloat16*)out.data_ptr(), xs.data_ptr<float>(),
+            suh ? (const __half*)suh->data_ptr() : nullptr, xh ? (__half*)xh->data_ptr() : nullptr);
     };
     if (nv == 48) launch(back_kernel<16, 48>);
     else if (nv == 24) launch(back_kernel<8, 24>);

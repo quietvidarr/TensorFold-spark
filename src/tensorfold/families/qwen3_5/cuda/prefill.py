@@ -126,7 +126,11 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
                 yr = torch.cat([deltanet.chain(q[:cut], k[:cut], v[:cut], g[:cut], beta[:cut], st.rec[i], part.rec[i]),
                                 deltanet.chain(q[cut:], k[cut:], v[cut:], g[cut:], beta[cut:], part.rec[i], final)])
                 part.conv[i] = torch.cat([st.conv[i], qkv[max(0, cut - keep):cut]])[-keep:].contiguous()
-            r = _row_mm(pg.gated_norm(yr, z, gdn.norm, c.eps), gdn.out, tp)
+            r = None
+            if not tp and pg is prefill_bf16 and hasattr(gdn.out, "prefill_rotated"):   # an EXL3 out projection
+                r = gdn.out.prefill_rotated(W, lambda suh, xh: glue.gated_norm_rot(yr, z, gdn.norm, c.eps, suh, xh), dev)
+            if r is None:
+                r = _row_mm(pg.gated_norm(yr, z, gdn.norm, c.eps), gdn.out, tp)
             st.conv[i] = torch.cat([st.conv[i], qkv[-keep:]])[-keep:].contiguous()
             st.rec[i] = final
         else:
@@ -145,7 +149,12 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
             kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
             vbuf[p0:p0 + W] = value
             out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
-            r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
+            r = None
+            if not tp and pg is prefill_bf16 and hasattr(attn.o, "prefill_rotated"):
+                r = attn.o.prefill_rotated(W, lambda suh, xh: glue.gate_mul_rot(out, qg, suh, xh, heads=c.heads,
+                                                                                head_dim=c.head_dim), dev)
+            if r is None:
+                r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         if layer.moe is not None:                          # routed experts read bf16 rows (their prefill form)
             x, h, _ = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
             pending = moe.run(h, layer.moe, prefill=True)

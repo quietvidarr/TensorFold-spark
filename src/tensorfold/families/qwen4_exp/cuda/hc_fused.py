@@ -8,9 +8,9 @@ from triton.experimental.gluon.language import BlockedLayout
 
 
 @gluon.jit
-def _write_norm(H, PSS, SCALE, NORMED, XS, BR, INJ, Y, WTS, RS, eps,
+def _write_norm(H, PSS, SCALE, NORMED, XS, BR, INJ, Y, WTS, RS, RINV, eps,
                 D: gl.constexpr, S: gl.constexpr, MODE: gl.constexpr, SLOTS: gl.constexpr,
-                WORLD: gl.constexpr, PAD: gl.constexpr):
+                WORLD: gl.constexpr, PAD: gl.constexpr, NORM: gl.constexpr):
     r = gl.program_id(0)
     vector: gl.constexpr = BlockedLayout([4], [32], [4], [0])
     scalars: gl.constexpr = BlockedLayout([1], [32], [4], [0])
@@ -46,24 +46,31 @@ def _write_norm(H, PSS, SCALE, NORMED, XS, BR, INJ, Y, WTS, RS, eps,
         for c in gl.static_range(D // 256):
             total += gl.sum(gl.where(chunks == c, partials, 0.0), axis=0)
         rinv = 1.0 / gl.sqrt(total / D + eps)
-        scale = gl.load(SCALE + s * D + d, valid, 0).to(gl.float32)
-        y = (hv * rinv * scale).to(gl.bfloat16)
-        gl.store(NORMED + r * (S * D) + s * D + d, y, valid)
-        grouped = gl.convert_layout(gl.reshape(y.to(gl.float32), (PAD // 32, 32)), group_layout)
-        sums = gl.convert_layout(gl.sum(grouped, axis=1), scalars)
-        groups = gl.arange(0, PAD // 32, layout=scalars)
-        gl.store(XS + r * (S * D // 32) + s * (D // 32) + groups, sums, groups < D // 32)
+        if NORM:
+            scale = gl.load(SCALE + s * D + d, valid, 0).to(gl.float32)
+            y = (hv * rinv * scale).to(gl.bfloat16)
+            gl.store(NORMED + r * (S * D) + s * D + d, y, valid)
+            grouped = gl.convert_layout(gl.reshape(y.to(gl.float32), (PAD // 32, 32)), group_layout)
+            sums = gl.convert_layout(gl.sum(grouped, axis=1), scalars)
+            groups = gl.arange(0, PAD // 32, layout=scalars)
+            gl.store(XS + r * (S * D // 32) + s * (D // 32) + groups, sums, groups < D // 32)
+        else:      # the 1/rms only: the read-out normalizes on the fly with these bits (exl3_mm *_normed)
+            gl.store(RINV + r * S + s + chunks * 0, gl.zeros((PAD // 256,), gl.float32, layout=scalars) + rinv,
+                     chunks == 0)
 
 
-def write_norm(h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor, normed: torch.Tensor,
-               xs: torch.Tensor, streams: int, eps: float, mode: int, branch=None, inject=None,
-               y=None, wts=None) -> None:
-    """Update streams in place, then normalize with the same 256-column sums and bf16 stores."""
+def write_norm(h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor, normed: torch.Tensor | None,
+               xs: torch.Tensor | None, streams: int, eps: float, mode: int, branch=None, inject=None,
+               y=None, wts=None, rinv: torch.Tensor | None = None) -> None:
+    """Update streams in place, then normalize with the same 256-column sums and bf16 stores; with ``rinv`` [rows,
+    streams] fp32 only each stream's 1/rms is stored (no normed rows, no group sums)."""
 
     rows, wide = h.shape
     d = wide // streams
+    norm = rinv is None
     _write_norm[(rows,)](
-        h, pss, scale, normed, xs, branch if branch is not None else h,
+        h, pss, scale, normed if norm else h, xs if norm else h, branch if branch is not None else h,
         inject if inject is not None else h, y if y is not None else h, wts if wts is not None else h,
-        rows * d, eps, D=d, S=streams, MODE=mode, SLOTS=wts.shape[1] if wts is not None else 1,
-        WORLD=branch.shape[0] if mode in (3, 4) else 1, PAD=triton.next_power_of_2(d), num_warps=4)
+        rows * d, rinv if rinv is not None else pss, eps, D=d, S=streams, MODE=mode,
+        SLOTS=wts.shape[1] if wts is not None else 1, WORLD=branch.shape[0] if mode in (3, 4) else 1,
+        PAD=triton.next_power_of_2(d), NORM=norm, num_warps=4)

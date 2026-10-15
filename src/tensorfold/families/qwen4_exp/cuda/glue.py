@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorfold.cuda.exl3.prefill import rot128
+
 from .image_rows import rope_axis
 
 from .kvquant import h32, quant_groups_4, quant_groups_8
@@ -405,6 +407,33 @@ def attn_gate(o: torch.Tensor, p: torch.Tensor, out: torch.Tensor, xs: torch.Ten
               head_dim: int) -> None:
     rows = o.shape[0]
     _attn_gate[(rows, q_heads)](o, p, out, xs, PW=p.shape[1], NQ=q_heads, HD=head_dim, num_warps=2)
+
+
+@triton.jit
+def _attn_gate_rot(O, P, SUH, XH, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constexpr):
+    """_attn_gate's bf16 value, then rot_in's rotation (suh, H128 a 128 block) for an EXL3 o projection: fp16 XH."""
+
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, HD)
+    o = tl.load(O + (r * NQ + h) * HD + d).to(tl.float32)
+    g = tl.load(P + r * PW + h * 2 * HD + HD + d).to(tl.float32)
+    out = (o / (1.0 + tl.exp(-g))).to(tl.bfloat16)
+    v = out.to(tl.float32) * tl.load(SUH + h * HD + d).to(tl.float32)
+    xr = rot128(tl.reshape(v, (HD // 128, 128)), HD // 128)
+    tl.store(XH + r * (NQ * HD) + h * HD + d, tl.reshape(xr, (HD,)))
+
+
+def attn_gate_rot(o: torch.Tensor, p: torch.Tensor, suh: torch.Tensor, xh: torch.Tensor, *, q_heads: int,
+                  head_dim: int) -> bool:
+    """attn_gate rotated for an EXL3 projection with ``suh`` straight into ``xh`` (rot_in's bits); False if it does
+    not fit."""
+
+    rows = o.shape[0]
+    if head_dim % 128 or xh.shape != (rows, q_heads * head_dim) or not xh.is_contiguous() or suh.numel() != q_heads * head_dim:
+        return False
+    _attn_gate_rot[(rows, q_heads)](o, p, suh, xh, PW=p.shape[1], NQ=q_heads, HD=head_dim, num_warps=2)
+    return True
 
 
 @triton.jit
