@@ -137,6 +137,35 @@ def test_f16_prompt_path_matches_chunked():
         assert torch.equal(part, b[150:350])          # a row's sums do not depend on the piece
 
 
+def test_f16_prompt_path_any_row_count():
+    """A resumed prompt's tail can be a few rows: F16.prefill and the on-the-fly read-out give a short piece's rows the
+    bits of the same rows in a longer one (up to 128 rows once took the decode tiling)."""
+    from tensorfold.families.qwen4_exp.cuda.exl3_mm import Scratch, f16, f16_prefill_normed
+
+    sc = Scratch(11)
+    for n, k in ((324, 10240), (10240, 320), (96, 2560)):
+        m = f16(sc, [0.02 * torch.randn((n, k))], "cuda")
+        sc.part = torch.empty((m.sk * 128 * n,), dtype=torch.float32, device="cuda")
+        x = torch.randn((400, k), device="cuda").bfloat16()
+        full = torch.empty((400, n), dtype=torch.float32, device="cuda")
+        m.prefill(x, full)
+        for a, r in ((0, 1), (5, 7), (40, 16), (100, 17), (130, 24), (200, 100), (250, 128), (3, 129)):
+            part = torch.empty((r, n), dtype=torch.float32, device="cuda")
+            m.prefill(x[a:a + r].contiguous(), part)
+            assert torch.equal(part, full[a:a + r]), (n, k, a, r)
+    S, D = 4, 2560
+    down = f16(sc, [0.02 * torch.randn((324, S * D))], "cuda")
+    h = torch.randn((300, S * D), device="cuda").bfloat16()
+    rinv = torch.rand((300, S), device="cuda") + 0.5
+    scale = torch.rand((S * D,), device="cuda") + 0.5
+    full = torch.empty((300, 324), dtype=torch.float32, device="cuda")
+    assert f16_prefill_normed(down, h, rinv, scale, S, full)
+    for a, r in ((0, 1), (9, 16), (77, 100), (150, 128)):
+        part = torch.empty((r, 324), dtype=torch.float32, device="cuda")
+        assert f16_prefill_normed(down, h[a:a + r].contiguous(), rinv[a:a + r].contiguous(), scale, S, part)
+        assert torch.equal(part, full[a:a + r]), (a, r)
+
+
 @pytest.mark.parametrize("k2s", [[8], [6, 8, 12, 16]])
 def test_prompt_rotated_in_kernel_is_bit_identical(k2s):
     """bf16 inputs rotate inside the prompt kernel (prefill_rot); fp16 inputs go through rot_in: the same bits."""

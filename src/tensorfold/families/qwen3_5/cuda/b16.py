@@ -46,7 +46,8 @@ def prompt_pair(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor) -> list[tor
     """Prompt rows times two weights in one launch, each ``prompt``'s bits."""
 
     if w0.dtype != torch.bfloat16 or w1.dtype != torch.bfloat16 or x.shape[1] % 64:
-        if w0.dtype == w1.dtype == torch.float16 and x.shape[0] >= 64 and x.shape[1] % 64 == 0 and x.stride(1) == 1:
+        if w0.dtype == w1.dtype == torch.float16 and x.shape[1] % 64 == 0 and x.stride(1) == 1:   # any row count: a
+            # row's bits never depend on its chunk (fewer than 64 rows on prompt() gave a resumed tail other bits)
             return [_prompt_f16(x, w0), _prompt_f16(x, w1)]
         return [prompt(x, w0), prompt(x, w1)]
     return _ext().b16_prompt_pair(x.to(torch.bfloat16).contiguous(), w0.contiguous(), w1.contiguous(), 0)

@@ -159,7 +159,9 @@ class F16:
         kernels a matrix a piece): fixed tiles and K order, so a row is still its own."""
 
         m = x.shape[0]
-        if m <= ROWS or out.stride(-1) != 1 or self.k % PROMPT_BK:
+        # any row count (a resumed prompt's tail of <= 128 rows too): below 129 rows this once took the decode
+        # tiling (K slices, hc_gemv), other bits than the same rows in a longer piece
+        if out.stride(-1) != 1 or self.k % PROMPT_BK:
             return self(x, out)
         if x.stride(1) != 1 or x.shape[1] != self.k:
             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
@@ -267,7 +269,7 @@ def f16_prefill_normed(down: "F16", h: torch.Tensor, rinv: torch.Tensor, scale: 
     m, k = h.shape
     bm, bn, bk, stages, warps = tiles or (*prompt_tiles(down.n, down.k), 4)
     d = k // streams
-    if (k != down.k or d % bk or m <= ROWS or out.stride(-1) != 1 or h.stride(1) != 1 or scale.numel() != k
+    if (k != down.k or d % bk or out.stride(-1) != 1 or h.stride(1) != 1 or scale.numel() != k
             or not rinv.is_contiguous() or rinv.shape[0] < m):
         return False
     grid = (triton.cdiv(m, bm) * triton.cdiv(down.n, bn),)

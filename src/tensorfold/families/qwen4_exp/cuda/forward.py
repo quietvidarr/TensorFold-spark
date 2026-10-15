@@ -57,7 +57,9 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
 
     # the write-back and the norm in one kernel (byte-checked against the two once a device): the MLX matrices'
     # prompts, and an EXL3 pack's (its hyper-connection matrices are fp16), whose read-out then skips the norm
-    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, (qmm.Q4, F16)):
+    # a prompt piece takes these paths at any row count (a row's bits never depend on its piece: a resumed prompt's
+    # short tail once took the plain read-out and up then mix, whose up sums differ from upmix's in the last bit)
+    if b.prefill and isinstance(hc.down, (qmm.Q4, F16)):
         fused = _hc_fuser(h.device)
         if fused is not None and HC_ON_THE_FLY and _readout_on_the_fly(hc, b, h, R, streams):
             # no normed rows: write-back and each stream's 1/rms, then down and up-mix normalize h on the fly
@@ -96,9 +98,9 @@ def _hc_rinv(b: Buffers, streams: int) -> torch.Tensor:
 def _readout_on_the_fly(hc: HC, b: Buffers, h: torch.Tensor, R: int, streams: int) -> bool:
     """Whether ``hc_block``'s on-the-fly read-out takes this call (both matrices fp16, the prompt tiles' shapes)."""
 
-    from .exl3_mm import F16, ROWS, prompt_tiles
+    from .exl3_mm import F16, prompt_tiles
 
-    if not (isinstance(hc.down, F16) and isinstance(hc.up, F16) and R > ROWS and h.stride(1) == 1):
+    if not (isinstance(hc.down, F16) and isinstance(hc.up, F16) and h.stride(1) == 1):
         return False
     wide = h.shape[1]
     d = wide // streams
@@ -153,7 +155,7 @@ def _readout_plain(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, stre
         if upmix is not None:
             upmix(b.act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams)
             return
-    if b.prefill and R > FUSED_ROWS:                  # an EXL3 pack's fp16 up matrix: up and mix in one kernel
+    if b.prefill:                                     # an EXL3 pack's fp16 up matrix: up and mix in one kernel
         from .exl3_mm import F16, upmix_f16
 
         if isinstance(hc.up, F16) and upmix_f16(b.act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams):

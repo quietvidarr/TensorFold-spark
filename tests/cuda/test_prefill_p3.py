@@ -83,6 +83,22 @@ def test_gate_pair_fp16_prompt():
         assert err <= 1.05 * err_old + 1e-6
 
 
+def test_gate_pair_fp16_prompt_any_row_count():
+    """A resumed prompt's tail can be a few rows: every row count (1..63 too) gives the rows of a wide call, so a
+    resumed prompt equals one prefilled from its start (below 64 rows the pair once fell back to prompt())."""
+    from tensorfold.families.qwen3_5.cuda import b16
+
+    g = torch.Generator(device="cuda").manual_seed(6)
+    x = torch.randn(300, 2048, device="cuda", generator=g).bfloat16()
+    w0 = (torch.randn(32, 2048, device="cuda", generator=g) * 0.02).half()
+    w1 = (torch.randn(32, 2048, device="cuda", generator=g) * 0.02).half()
+    full = b16.prompt_pair(x, w0, w1)
+    for a, n in ((0, 1), (7, 2), (33, 14), (100, 31), (200, 63), (237, 63)):
+        part = b16.prompt_pair(x[a:a + n].contiguous(), w0, w1)
+        for y, p in zip(full, part):
+            assert torch.equal(y[a:a + n], p), (a, n)
+
+
 def test_rotated_producers_match_rot_in():
     """gated_norm / gate_mul (qwen3_5), attn_gate and the DeltaNet back end (Flash Next) writing an EXL3 projection's
     rotated input: the bits of the bf16 output followed by rot_in."""
