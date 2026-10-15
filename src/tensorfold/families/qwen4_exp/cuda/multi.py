@@ -331,7 +331,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
-        self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
+        self.fills[s.sid] = [e, mtp, begin, [(resume["state"], resume["tail"])] if same else None]
         self.filling.append(s)
 
     def _ends(self, s: Stream) -> tuple[int, ...]:

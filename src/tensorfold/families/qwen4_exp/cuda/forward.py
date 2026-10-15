@@ -199,10 +199,12 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
     li = segs[0][0].lin_index[layer.index]
     if b.prefill:
         _mm(b.mixed[:R], g.proj, b.xs_mixed[:R], b.proj[0, :R], b)
-        at = {cut.at: cut for cut in cuts}
+        at: dict = {}                          # a piece's kept points (patch 0029: any number, in row order)
+        for cut in cuts:
+            at.setdefault(cut.at, []).append(cut)
         rot = _rotated_out(w, g.out, R)        # an EXL3 out projection: back writes its rotated input
         for st, a0, a1 in segs:
-            _prefill_chain(g, st, li, b, a0, a1, c, at.get(a0), rot)
+            _prefill_chain(g, st, li, b, a0, a1, c, sorted(at.get(a0, ()), key=lambda x: x.row), rot)
         if rot is not None:
             from tensorfold.cuda.exl3 import prefill as x3prefill
 
@@ -243,29 +245,33 @@ def _back(y, p, g, c, b: Buffers, a0: int, a1: int, rot) -> None:
         gdn_io.back(y, p, g.norm, c.eps, b.gout[a0:a1], b.gxs[a0:a1], rot[0], rot[1][a0:a1])
 
 
-def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None,
-                   rot=None) -> None:
-    """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row)."""
+def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cuts=None, rot=None) -> None:
+    """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row). ``cuts`` (a Cut or a list in
+    row order): each kept point's state; the chain runs as one launch per span between them (one launch's bits)."""
 
     n, p, cur = a1 - a0, b.proj[0, a0:a1], st.cur[li]
+    cuts = [] if cuts is None else [cuts] if isinstance(cuts, Cut) else list(cuts)
     b.conv_ptr.fill_(st.conv[li].data_ptr())
     q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias, c.nk)
-    if cut is None:
+    if not cuts:
         y = shared_gdn.chain(q, k, v, gt, beta, st.rec[cur, li], st.rec[1 - cur, li])
         _back(y, p, g, c, b, a0, a1, rot)
-    else:                                        # the rows before the kept point, its state, then the rest from it
-        m, mid = cut.row, st.rec[1 - cur, li]
-        y = shared_gdn.chain(q[:m], k[:m], v[:m], gt[:m], beta[:m], st.rec[cur, li], mid)
-        _back(y, p[:m], g, c, b, a0, a0 + m, rot)
-        if cut.rec is None:
-            cut.rec, cut.conv = torch.empty_like(st.rec[0]), torch.empty_like(st.conv)
-        cut.rec[li].copy_(mid)
-        cut.conv[li].copy_(st.conv[li])
-        shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + m], m, c.conv_dim)
-        y = shared_gdn.chain(q[m:], k[m:], v[m:], gt[m:], beta[m:], mid, st.rec[cur, li])
-        _back(y, p[m:], g, c, b, a0 + m, a1, rot)
-        cur = 1 - cur                            # the second launch wrote the state back where the first read it
-    st.cur[li] = 1 - cur
+        st.cur[li] = 1 - cur
+    else:                                        # each span from the previous point's state; the states ping-pong
+        s0, src, dst = 0, st.rec[cur, li], st.rec[1 - cur, li]
+        for cut in cuts:
+            m = cut.row
+            y = shared_gdn.chain(q[s0:m], k[s0:m], v[s0:m], gt[s0:m], beta[s0:m], src, dst)
+            _back(y, p[s0:m], g, c, b, a0 + s0, a0 + m, rot)
+            if cut.rec is None:
+                cut.rec, cut.conv = torch.empty_like(st.rec[0]), torch.empty_like(st.conv)
+            cut.rec[li].copy_(dst)
+            cut.conv[li].copy_(st.conv[li])
+            shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + m], m, c.conv_dim)
+            s0, src, dst = m, dst, src
+        y = shared_gdn.chain(q[s0:], k[s0:], v[s0:], gt[s0:], beta[s0:], src, dst)
+        _back(y, p[s0:], g, c, b, a0 + s0, a1, rot)
+        st.cur[li] = 0 if dst.data_ptr() == st.rec[0, li].data_ptr() else 1
     shift_windows(st.conv[li:li + 1], b.proj[0:1, a0:a1], n, c.conv_dim)
 
 

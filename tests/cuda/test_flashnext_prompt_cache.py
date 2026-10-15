@@ -294,3 +294,43 @@ def test_filling_requests_do_not_retain_evicted_snapshot_references(w):
     while dec.live():
         dec.finish(dec.round())
     assert len(dec.kept) == 1
+
+
+def test_the_concurrent_decoder_keeps_every_point_inside_one_pass(w, monkeypatch):
+    """Patch 0029: message-start points never end a prompt pass; each is captured inside the one pass (DeltaNet
+    chains split there) with the bits of a prefill stopped at it, and the reply equals a plain prefill's."""
+
+    from tensorfold.families.qwen4_exp.cuda import multi_fill
+
+    sampling = Sampling(seed=5, top_k=20, top_p=0.95)
+    prompt = _prompt(900, seed=13)
+    pts = [260, 520, 521, 777]
+    calls = []
+    real = multi_fill.compute
+
+    def counted(w_, segs, b, **kw):
+        calls.append(segs[-1][2])
+        return real(w_, segs, b, **kw)
+
+    monkeypatch.setattr(multi_fill, "compute", counted)
+    dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.3, keep=8,
+                       points=lambda ids: [p for p in pts if p < len(ids)])
+    got: list[int] = []
+    s = Stream(list(prompt), 14, sampling, emit=lambda new: got.extend(new))
+    dec.admit(s)
+    while dec.live():
+        dec.finish(dec.round())
+    assert calls == [len(prompt)]                                   # one pass, no pass ends at a point
+    e = Engine(w, capacity=1024, max_rows=8, prefill_rows=CHUNK)
+    first = prefill(e, prompt, sampling)
+    assert got == serial_decode(e, first, 14, sampling, stop_eos=False).tokens
+    kept = {len(ids): (snap, tail) for ids, _, snap, tail in dec.kept}
+    for p in pts:
+        assert p in kept, (p, sorted(kept))
+        fresh = Engine(w, capacity=1024, max_rows=8, prefill_rows=CHUNK)
+        prefill(fresh, prompt[:p], sampling)
+        snap, tail = kept[p]
+        ref = fresh.st.snapshot()
+        assert snap["pos"] == ref["pos"] == p
+        assert all(_same_bits(snap[k], ref[k]) for k in ("rec", "conv", "ple_tail")), p
+        assert tail is not None and _same_bits(tail, fresh.last_streams), p

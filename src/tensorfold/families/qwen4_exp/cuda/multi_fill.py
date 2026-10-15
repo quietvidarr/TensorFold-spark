@@ -78,7 +78,11 @@ class PromptPasses:
         pieces, room = [], self._pass_rows() if rows is None else rows
         for s in self._order():
             e, mtp, start, _ = self.fills[s.sid]
-            n = min(next((p for p in e.stops if p > start), len(s.prompt)) - start, room)
+            # one GPU (patch 0029): a pass keeps its prompts' points inside it, so a piece never ends at one;
+            # two ranks keep the agreed plan's pieces (to the next point)
+            one_gpu = getattr(getattr(self, "w", None), "comm", None) is None
+            stop = len(s.prompt) if one_gpu else next((p for p in e.stops if p > start), len(s.prompt))
+            n = min(stop - start, room)
             ends = sum(1 for x, a, k in pieces if a + k == len(x.prompt))
             if n == 0 or (start + n == len(s.prompt) and ends == ENDS):
                 break
@@ -124,34 +128,35 @@ class PromptPasses:
 
         return entry_end(s.prompt) if s.draft and vision_prefix.keepable(s.st) else None
 
-    def _point(self, s: Stream, start: int) -> int | None:
-        """The next message-start or prompt-end snapshot this prompt piece can reach."""
+    def _points(self, s: Stream, start: int, n: int) -> list[int]:
+        """The message-start and prompt-end snapshots in (start, start + n], in order."""
 
         if not s.draft or not vision_prefix.keepable(s.st):
-            return None
-        return next((p for p in self.fills[s.sid][0].stops if p > start), self._keep_at(s))
+            return []
+        end = self._keep_at(s)
+        got = sorted({p for p in self.fills[s.sid][0].stops if start < p <= start + n}
+                     | ({end} if end is not None and start < end <= start + n else set()))
+        return got
 
     def _cuts(self, pieces, segs) -> list[Cut]:
         """The kept points strictly inside the pass's pieces, where their DeltaNet chains split."""
 
         return [Cut(k - a, at=a0) for (s, a, n), (_, a0, _) in zip(pieces, segs)
-                if (k := self._point(s, a)) is not None and a < k < a + n]
+                for k in self._points(s, a, n) if k < a + n]
 
     def _absorb(self, pieces, segs, cuts=()) -> list[torch.Tensor]:
         """After a pass's forward: each prompt's last row and kept point, the MTP head's absorb, the commits."""
 
         lasts = [self.pbuf.streams[a1 - 1:a1].clone() for _, _, a1 in segs]
-        at, points = {cut.at: cut for cut in cuts}, []
+        at, points = {(cut.at, cut.row): cut for cut in cuts}, []
         for (s, a, n), (st, a0, _) in zip(pieces, segs):      # before the MTP head writes the pass's streams
-            k = self._point(s, a)
-            if k is None or not a < k <= a + n:
-                continue
-            row, mtp = k - a, self.fills[s.sid][1]
-            mtp_len = st.mtp_len + row - 1 if mtp else st.mtp_len       # every row but the point's last
-            tail = self.pbuf.streams[a0 + row - 1:a0 + row].clone() if mtp else None
-            cut = at.get(a0)
-            snap = None if cut is None else cut_snapshot(self.w, st, self.pbuf, cut, mtp_len)
-            points.append((s, mtp_len, tail, snap))
+            for k in self._points(s, a, n):
+                row, mtp = k - a, self.fills[s.sid][1]
+                mtp_len = st.mtp_len + row - 1 if mtp else st.mtp_len       # every row but the point's last
+                tail = self.pbuf.streams[a0 + row - 1:a0 + row].clone() if mtp else None
+                cut = at.get((a0, row))
+                snap = None if cut is None else cut_snapshot(self.w, st, self.pbuf, cut, mtp_len)
+                points.append((s, mtp_len, tail, snap))
         absorb = [(s.st, s.prompt[a + 1:a + n + 1], self.pbuf.streams[a0:a0 + n])
                   for (s, a, n), (_, a0, _) in zip(pieces, segs) if self.fills[s.sid][1] and a + 1 < len(s.prompt)]
         if absorb:                   # the MTP head absorbs each prompt's rows (its cache in position order)
@@ -161,8 +166,10 @@ class PromptPasses:
                 st.set_mtp_len(st.mtp_len + len(nxt))
         for (s, a, n), (st, a0, _) in zip(pieces, segs):
             commit(self.w, st, self.pbuf, n, n, at=a0)
+        for s, _, _, _ in points:
+            self.fills[s.sid][3] = []
         for s, mtp_len, tail, snap in points:            # a point that ends its piece: the state as committed
-            self.fills[s.sid][3] = (snap if snap is not None else {**s.st.snapshot(), "mtp_len": mtp_len}, tail)
+            self.fills[s.sid][3].append((snap if snap is not None else {**s.st.snapshot(), "mtp_len": mtp_len}, tail))
         return lasts
 
     def _failed(self, pieces, exc: Exception) -> list[Stream]:
@@ -190,10 +197,12 @@ class PromptPasses:
             s.prefill_s += spent
             e, mtp, _, kept = self.fills[s.sid]
             self.fills[s.sid][2] = a + n
-            if kept is not None and a < kept[0]["pos"] <= a + n:
-                self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept)
+            todo = [(list(s.prompt[:got[0]["pos"]]), s.st, *got) for got in kept or ()   # in position order
+                    if a < got[0]["pos"] <= a + n]
             self.fills[s.sid][3] = None
             if a + n < len(s.prompt):
+                for args in todo:
+                    self._remember(*args)
                 continue
             self.filling.remove(s)
             self.fills.pop(s.sid)
@@ -225,6 +234,8 @@ class PromptPasses:
             s.started = time.perf_counter()
             self.streams[s.sid] = s
             s.take([first], self._ends(s))
+            for args in todo:                            # the points' disk copies after the first token, not before
+                self._remember(*args)
             if s.done:
                 joined.append(s)
         self._joined_ranks()
