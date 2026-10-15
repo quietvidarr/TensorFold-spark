@@ -1,3 +1,8 @@
+> **Note from quietvidarr.** I built this fork to run Qwen3.8 Flash Next and Qwen3.6-35B-A3B EXL3 on a DGX Spark (GB10).
+> It adds deterministic prefill and decode kernels (about +20-30% prefill, faster decode), an SSD prompt cache with
+> resume points at every message start, and bit-exact resume. All credit for TensorFold itself goes to
+> [ashhart/TensorFold](https://github.com/ashhart/TensorFold). What changed: [CHANGES.md](CHANGES.md).
+
 # TensorFold (Spark fork)
 
 Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) 0.6.5 (`609ca419`), Apache-2.0. All credit for TensorFold goes to its authors.
