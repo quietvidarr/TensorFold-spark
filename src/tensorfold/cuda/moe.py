@@ -178,6 +178,8 @@ _scratch: dict[tuple, MoEBuffers] = {}
 def run(x: torch.Tensor, m: Routed, *, prefill: bool = False) -> torch.Tensor:
     """x [R, D] bf16 -> [R, D] bf16: its top-k experts by renormalized softmax weight plus the shared expert."""
 
+    if not isinstance(m, Routed):                               # another expert format runs its own (EXL3 packs)
+        return m.run(x, prefill=prefill)
     rows = x.shape[0]
     size = 1 << max(4, (rows - 1).bit_length())                 # scratch per power of two, reused by every layer
     key = (size, m.count, m.top_k, m.experts.width, m.experts.dims, prefill, x.device)

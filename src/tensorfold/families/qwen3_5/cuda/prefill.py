@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -20,7 +21,7 @@ from .forward import State, grow as _grow
 from .qmm_fast import matmul, matmul_partial, tile
 from .weights import Plain, QLinear, Weights
 
-CHUNK = 4096
+CHUNK = int(os.environ.get("TF_PREFILL_CHUNK", "4096"))
 TAP_LAYERS = (5, 19, 33, 47, 61)
 
 

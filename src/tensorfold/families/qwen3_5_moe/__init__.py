@@ -16,16 +16,22 @@ DRAFTER = ""                  # Macs and CUDA draft with the checkpoint's MTP la
 DFLASH = "z-lab/Qwen3.6-35B-A3B-DFlash"       # Macs, --drafter: chains of each position's own argmax
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
 KERNEL_VERSION = "v1"
-# the CUDA engine's kernels read MLX affine weights of this (bits, group size)
+# the CUDA engine's kernels read MLX affine weights of this (bits, group size), or an EXL3 pack
 CUDA_QUANTIZATION = (4, 64)
+QUANT_METHODS = {"cuda": ("mlx", "exl3")}   # MLX affine 4-bit g64, EXL3 packs (ExLlamaV3's per-expert layout)
+EXL3_VARIANT = "any"                         # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
 CUDA_PREFILL_FP8 = True            # --prefill-fp8: the attention and DeltaNet projections' FP8 prompt kernel
+CUDA_CHECKPOINT_SLOTS = True       # --checkpoint-slots: prompt states the concurrent decoder keeps (default 3)
 
 
 def check(model_dir: str | Path) -> None:
-    """One GPU, MLX 4-bit weights in groups of 64."""
+    """One GPU, MLX 4-bit weights in groups of 64, or an EXL3 pack (its tensors are checked by the loader)."""
 
-    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quantization, read_config
+    from tensorfold.families import (EXL3_QUANT, OWN_MODEL_HELP, describe_quantization, quant_method, quantization,
+                                     read_config)
 
+    if quant_method(read_config(model_dir)) == EXL3_QUANT:
+        return
     if quantization(read_config(model_dir)) != CUDA_QUANTIZATION:
         raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}); this "
                          f"checkpoint has {describe_quantization(read_config(model_dir))}. {OWN_MODEL_HELP}")
@@ -109,4 +115,4 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     if streams > 1 and not 0 <= depth <= 15:
         raise ValueError(f"--parallel verifies up to 16 rows a stream: --mtp-drafts 0 to 15, not {depth}")
     return Qwen36Engine(Path(model_dir), depth=depth, context=context, context_explicit=options.get("context_explicit"),
-                        streams=streams)
+                        streams=streams, keep=options.get("checkpoint_slots"))

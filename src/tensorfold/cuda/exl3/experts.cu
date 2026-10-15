@@ -387,8 +387,9 @@ void exl3x_prefill_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& members, const at::Tensor& work, at::Tensor& Z, int64_t mats, int64_t K,
                         int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t max_work,
                         const at::Tensor* xr, int64_t xr_stride, const at::Tensor* suh0, const at::Tensor* suh1) {
-    TORCH_CHECK(K % tf_exl3x::PF_BKMAX == 0 && N % tf_exl3x::PF_COLS == 0, "prefill experts: K must split in ",
-                tf_exl3x::PF_BKMAX, " and N in ", tf_exl3x::PF_COLS);
+    TORCH_CHECK(K % tf_exl3x::PF_BKMAX == 0 && (N % tf_exl3x::PF_COLS == 0 || N % tf_exl3x::PF_COLS_NARROW == 0),
+                "prefill experts: K must split in ", tf_exl3x::PF_BKMAX, " and N in ", tf_exl3x::PF_COLS, " or ",
+                tf_exl3x::PF_COLS_NARROW);
     tf_exl3x::PrefillArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
     a.x1 = reinterpret_cast<const half*>(X1.data_ptr());

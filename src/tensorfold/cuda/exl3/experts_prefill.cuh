@@ -320,12 +320,14 @@ struct PrefillArgs {
 };
 
 constexpr int PF_COLS = 320;
+constexpr int PF_COLS_NARROW = 256;                // a second strip for widths 320 does not divide (Qwen3.6's 512 / 2048)
 constexpr int PF_ROWS = 128;                       // members a work item
 constexpr int PF_BKMAX = 128;                      // K must split in it (a rotation chunk)
 
 template <int CB, int LO, int HI, int WM, int WN, int MTW, int NTW, int BK, int AST, bool ROT>
 void prefill_go_(const PrefillArgs& a, cudaStream_t stream, int skip_k2) {
-    static_assert(WN * NTW * 16 == PF_COLS, "a program covers PF_COLS columns");
+    constexpr int COLS = WN * NTW * 16;              // a program's column strip (PF_COLS or PF_COLS_NARROW)
+    static_assert(COLS == PF_COLS || COLS == PF_COLS_NARROW, "a program covers PF_COLS or PF_COLS_NARROW columns");
     using L = PrefillLayout<WM, WN, MTW, NTW, BK, AST, HI, ROT>;
     auto kern = prefill_kernel<CB, LO, HI, WM, WN, MTW, NTW, BK, AST, ROT>;
     static bool once = [&] {
@@ -333,7 +335,7 @@ void prefill_go_(const PrefillArgs& a, cudaStream_t stream, int skip_k2) {
         return true;
     }();
     (void)once;
-    dim3 grid((unsigned)(a.N / PF_COLS), (unsigned)a.nexp_max, (unsigned)a.mats);
+    dim3 grid((unsigned)(a.N / COLS), (unsigned)a.nexp_max, (unsigned)a.mats);
     kern<<<grid, WM * WN * 32, L::BYTES, stream>>>(a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount,
                                                     a.members, a.work, a.z, a.K, a.N, a.P, a.maxm, a.slots, a.xr,
                                                     a.xr_stride, a.suh0, a.suh1, skip_k2);
@@ -347,13 +349,26 @@ void prefill_go(const PrefillArgs& a, cudaStream_t stream, int skip_k2 = -1) {
 
 // Shared memory is sized for the widest trellis a launch takes. 4-bit experts (K2 8) get their own launch, sized for
 // them, so two programs fit an SM; any other width (Flash Next's 6-bit shared expert) goes to a second, generic one.
-template <int CB>
-void prefill_launch(const PrefillArgs& a, cudaStream_t stream) {
-    constexpr int W = 1, N = 10, M = 8, T = 2, B = 64, S = 2;  // 10 warps, 128 members, 320 columns, K 64 a stage, 2 deep
+template <int CB, int N>
+void prefill_widths(const PrefillArgs& a, cudaStream_t stream) {
+    constexpr int W = 1, M = 8, T = 2, B = 64, S = 2;  // N warps, 128 members, 16 * N * T columns, K 64 a stage, 2 deep
     if (a.lo <= 8 && a.hi >= 8) prefill_go<CB, 8, 8, W, N, M, T, B, S>(a, stream);
     if (a.lo == 8 && a.hi == 8) return;
+    if (a.lo == 12 && a.hi > 12) {                     // 6-bit experts with a wider shared one (Qwen3.6-35B-A3B):
+        prefill_go<CB, 12, 12, W, N, M, T, B, S>(a, stream);          // the 6-bit ones K 64 a stage, sized for them
+        prefill_go<CB, 2, 16, W, N, M, T, 32, 2>(a, stream, 12);      // the rest as before
+        return;
+    }
     if (a.hi <= 12) prefill_go<CB, 2, 12, W, N, M, T, B, S>(a, stream, 8);   // e.g. a 6-bit shared expert
     else prefill_go<CB, 2, 16, W, N, M, T, 32, 2>(a, stream, 8);           // up to 8 bits: K 32 a stage fits
+}
+
+// 320-column strips (10 warps) where they divide N (Flash Next: unchanged); else 256 (8 warps: Qwen3.6-35B-A3B's
+// expert width 512 and model width 2048). A strip only splits the columns, so every output's K sum is the same.
+template <int CB>
+void prefill_launch(const PrefillArgs& a, cudaStream_t stream) {
+    if (a.N % PF_COLS == 0) prefill_widths<CB, 10>(a, stream);
+    else prefill_widths<CB, 8>(a, stream);
 }
 
 }  // namespace tf_exl3x

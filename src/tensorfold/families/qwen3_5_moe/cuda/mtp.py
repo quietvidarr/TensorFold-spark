@@ -11,7 +11,8 @@ from tensorfold.cuda import moe
 from tensorfold.cuda.kernels import attention as tree_attention
 from tensorfold.cuda.kernels.prefill_attention import attention as prefill_attention
 from tensorfold.families.qwen3_5.cuda import glue
-from tensorfold.families.qwen3_5.cuda.qmm_fast import matmul, tile, untile
+from tensorfold.families.qwen3_5.cuda.forward import _mm as matmul      # MLX words or an EXL3 pack's layers
+from tensorfold.families.qwen3_5.cuda.qmm_fast import tile, untile
 from tensorfold.families.qwen3_5.cuda.weights import QLinear, Weights
 
 from .weights import MTP
@@ -73,7 +74,12 @@ class Head:
     def __init__(self, w: Weights, m: MTP, ids: np.ndarray | None = None) -> None:
         self.w, self.m = w, m
         self.ids, self.head = None, w.head
-        if ids is not None:                           # score only these token ids when drafting
+        if ids is not None and not isinstance(w.head, QLinear):    # an EXL3 head: its rows requantized once
+            from .exl3 import draft_head
+
+            self.ids = torch.as_tensor(ids, dtype=torch.int64, device=w.norm.device)
+            self.head = draft_head(w.head, self.ids)
+        elif ids is not None:                         # score only these token ids when drafting
             full = untile(w.head)
             self.ids = torch.as_tensor(ids, dtype=torch.int64, device=w.norm.device)
             self.head = tile(QLinear(full.weight[self.ids].contiguous(), full.scales[self.ids].contiguous(),
@@ -148,10 +154,13 @@ class Head:
 
         w, m, c = self.w, self.m, self.w.config
         n = states.shape[0]
-        e = glue.embed(ids, w.embed.weight, w.embed.scales, w.embed.biases, c.hidden)
+        e = glue.embedding(ids, w.embed)                 # MLX words dequantized, or an EXL3 pack's bf16 table
         _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
         _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
-        x = (matmul(en, m.fc_e, exs).float() + matmul(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
+        if m.fc is not None:                             # an EXL3 pack's fc over [embedding | hidden]
+            x = matmul(torch.cat([en, hn], dim=-1), m.fc)
+        else:
+            x = (matmul(en, m.fc_e, exs).float() + matmul(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
         x, h, xs = glue.add_rmsnorm(x, None, m.input_norm, c.eps)
         a = m.attn
         qg = matmul(h, a.q, xs)

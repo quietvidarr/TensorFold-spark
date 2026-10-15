@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -16,10 +17,35 @@ from tensorfold.families.qwen3_5.cuda.engine import entry_end
 from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward
 from tensorfold.families.qwen3_5.cuda.multi import kept, private
 
+from tensorfold.cuda import keep_rank
+
+from . import disk_points
 from .decode import COPY_ROWS, Carry, extend, mtp_round, picks
 from .mtp import Cache, Head
 
-STEP = 1024          # prompt rows a prefill step takes while other streams decode
+STEP = int(os.environ.get("TF_PREFILL_STEP", "1024"))   # prompt rows a prefill step takes while other streams decode
+
+
+class KeptEnds(PrefixCache):
+    """``PrefixCache`` whose cap drops by ``keep_rank`` (patch 0010; 0103 before): a state inside a conversation's
+    history first (a newer state of it extends it; it is on disk), then a conversation's newest state, then a shared
+    starting point (a reused system prompt, a point resumed with 2+ different continuations, the base of 2+ diverging
+    kept states), the oldest first within each (a hit makes an entry the newest); a state not yet copied for the disk
+    store last of all."""
+
+    def __init__(self, keep: int = 8) -> None:
+        super().__init__(keep)
+        self.conts: dict = {}                              # point -> the continuations requests resumed it with
+        self.waiting = lambda entry: False                 # not yet copied for the disk store (set by the decoder)
+
+    def _drop(self, among: list) -> None:
+        idx = {id(e): i for i, e in enumerate(self.entries)}
+        at = keep_rank.victim([e[0] for e in self.entries],
+                              [len(self.conts.get(keep_rank.point_key(e[0]), ())) for e in self.entries],
+                              [self.waiting(e) for e in self.entries], [idx[id(e)] for e in among if id(e) in idx])
+        gone = self.entries[at]
+        self.entries = [e for e in self.entries if e is not gone]
+        self.hit &= {tuple(e[0]) for e in self.entries}
 
 
 @dataclass
@@ -43,6 +69,9 @@ def own(mc: Cache, rows: int) -> Cache:
 class MultiDecoder:
     """The ``Scheduler``'s decoder: a prefill step, then every stream's window (16 rows at most) in one forward; a lone stream replays ``graphs``."""
 
+    store = None                                     # the prompt store on disk (patch 0104); set by __init__ when it is on
+    unsaved = ()                                     # patch 0010/0107: kept states waiting for room in the disk queue
+
     def __init__(self, w, head: Head | None, *, depth: int, confidence: float, context: int = 0, keep: int = 3,
                  points=None, graphs=None) -> None:
         if head is not None and depth > 0 and not 1 <= depth <= 15:
@@ -55,10 +84,16 @@ class MultiDecoder:
         self.streams: dict[int, Stream] = {}         # decoding
         self.filling: list[Stream] = []              # admitted, prompts still prefilling (oldest first)
         self.points = points                         # a prompt's message starts to keep states at, or None
-        self.cache = PrefixCache(keep)               # (ids, state, (head cache, held row)) at message starts and ends
+        self.cache = KeptEnds(keep)                  # (ids, state, (head cache, held row)) at message starts and ends
         self.next_id = 0
         self.graphs = graphs if self.head is not None else None
         self.resident: Stream | None = None          # the stream whose state is in the graphs' buffers
+        self.store = disk_points.open_store(self) if self.head is not None else None
+        self.unsaved = []
+        self._watch()
+
+    def _watch(self) -> None:
+        self.cache.waiting = lambda e: any(u[2] is e[1] for u in self.unsaved)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
@@ -74,7 +109,13 @@ class MultiDecoder:
                                  "context (--context)")
             s.count = min(s.count, room)
         drafting = s.draft and self.head is not None
+        if drafting and self.store is not None:
+            disk_points.restore(self, s.prompt)
         hit = self.cache.longest(s.prompt) if drafting else None
+        if hit is not None:
+            keep_rank.note(self.cache.conts, s.prompt, len(hit[0]), [e[0] for e in self.cache.entries])
+        if hit is not None and self.store is not None:
+            self.store.used(self.store.prefix(s.prompt), len(hit[0]))
         need = len(s.prompt) + s.count                # the most the stream's attention caches ever hold
         s.st = private(hit[1] if hit else State(self.w), need)
         s.snap = None
@@ -108,7 +149,18 @@ class MultiDecoder:
 
     def _keep(self, ids: list[int], s: Stream) -> None:
         d = s.snap
-        self.cache.add(ids, kept(s.st), (d.cache.view(), d.carry.states.clone()))
+        self._add(ids, kept(s.st), (d.cache.view(), d.carry.states.clone()))
+
+    def _add(self, ids: list[int], state, snap) -> None:
+        """A kept entry, and its copy queued for the disk store when that is on."""
+
+        if self.store is not None and snap[1] is not None:
+            try:
+                disk_points.capture(self, ids, state, snap)
+            except Exception as exc:  # noqa: BLE001 - the disk copy never stops a request
+                self.store.stats["errors"] += 1
+                print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
+        self.cache.add(ids, state, snap)
 
     def _step(self, s: Stream, stop: int) -> int | None:
         """Prefill prompt[pos:stop] (the same bits for any stops); at the end, sample the first token and start decoding."""
@@ -119,7 +171,7 @@ class MultiDecoder:
                (s.stops and len(s.prompt) - s.stops[-1] < MIN_GAP) else None)
 
         def keep(point, state, cache, held):
-            self.cache.add(list(s.prompt[:point]), kept(state), (cache.view(), held.clone()))
+            self._add(list(s.prompt[:point]), kept(state), (cache.view(), held.clone()))
 
         try:
             normed, held = extend(self.w, self.head if d is not None else None, s.prompt, s.st,
@@ -154,6 +206,8 @@ class MultiDecoder:
     def round(self) -> list[Stream]:
         """A prefill step for the next queued prompt, then one round over the decoding streams; returns the finished."""
 
+        if self.unsaved:
+            disk_points.retry(self)                  # patch 0107: as soon as the disk queue has room
         done = self._fill() if self.filling else []
         live = [s for s in self.streams.values() if not s.done]
         if not live:
@@ -293,11 +347,16 @@ class MultiDecoder:
         """A synthetic request and forwards at every row count ``streams`` windows bring, so no request compiles a kernel; then forgotten."""
 
         s = Stream([0] * (min(300, self.context - self.depth - 2) if self.context else 300), 2, None, draft=True)
-        self.admit(s)
-        while not s.done:
-            self.finish(self.round())
-        self.finish([s])
-        self.cache = PrefixCache(self.cache.keep)
+        store, self.store = self.store, None             # the warm-up prompt's states stay off the disk
+        try:
+            self.admit(s)
+            while not s.done:
+                self.finish(self.round())
+            self.finish([s])
+        finally:
+            self.store = store
+        self.cache = KeptEnds(self.cache.keep)
+        self._watch()
         st = State(self.w)
         for rows in sorted({1, 16, 32, 64, 128, 16 * streams}):
             if rows > 16 * streams:
@@ -320,6 +379,8 @@ class MultiDecoder:
             self.streams.pop(s.sid, None)
             if s is self.resident:
                 self.resident = None
+        if self.unsaved and not self.streams and not self.filling:
+            disk_points.retry(self, force=True)      # patch 0107: idle: every waiting state is copied now
 
     def drop(self) -> list[Stream]:
         """After an error in a round: forget the live streams and the queued prompts."""

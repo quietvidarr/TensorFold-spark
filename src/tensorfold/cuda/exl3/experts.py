@@ -27,7 +27,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -176,13 +176,15 @@ class Scratch:
 
 
 PREFILL_COLS, PREFILL_K, PREFILL_PASS = 320, 128, 128   # the prompt kernel's column strip, K split and members a program
+PREFILL_COLS_NARROW = 256      # the strip a launch takes where 320 does not divide its N (Qwen3.6-35B-A3B: 512, 2048)
 
 
 def prompt_kernel_fits(ex: Exl3RoutedExperts) -> bool:
     """The prompt kernel's shapes: gate/up and down split in its column strips and K steps."""
 
     D, I = ex.dims, ex.width
-    return D % PREFILL_K == 0 and I % PREFILL_K == 0 and I % PREFILL_COLS == 0 and D % PREFILL_COLS == 0
+    strips = lambda n: n % PREFILL_COLS == 0 or n % PREFILL_COLS_NARROW == 0     # noqa: E731
+    return D % PREFILL_K == 0 and I % PREFILL_K == 0 and strips(I) and strips(D)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,

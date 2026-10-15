@@ -54,23 +54,32 @@ def routed(prefix: str, get: Callable, top_k: int) -> Routed:
 def load(model_dir: str | Path) -> Weights:
     """The checkpoint on the GPU, projections packed for the shared matmul and experts for the grouped kernels."""
 
+    from tensorfold.families.qwen3_5.cuda.exl3_load import quant_config
+
+    if quant_config(Path(model_dir)) is not None:              # an EXL3 pack: its own reader (``exl3.py``)
+        from .exl3 import load as load_exl3
+
+        return load_exl3(model_dir)
     return load_dense(model_dir, tiled=True,
                       mlp=lambda prefix, get, qlinear, cfg: {"moe": routed(prefix, get, cfg.top_k)})
 
 
 @dataclass
 class MTP:
-    """The MTP layer: fc's embedding and hidden halves, its norms, one attention layer with routed experts, a norm."""
+    """The MTP layer: fc's embedding and hidden halves, its norms, one attention layer with routed experts, a norm.
+
+    An EXL3 pack's keeps fc whole (``fc``, over [embedding | hidden]; ``fc_e``/``fc_h`` None) and EXL3 experts."""
 
     norm_e: torch.Tensor
     norm_h: torch.Tensor
-    fc_e: QLinear
-    fc_h: QLinear
+    fc_e: QLinear | None
+    fc_h: QLinear | None
     input_norm: torch.Tensor
     post_norm: torch.Tensor
     attn: Attention
     moe: Routed
     norm: torch.Tensor
+    fc: object = None
 
 
 def mtp_tensors(model_dir: str | Path) -> dict[str, torch.Tensor] | None:
@@ -96,8 +105,13 @@ def mtp_tensors(model_dir: str | Path) -> dict[str, torch.Tensor] | None:
 def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda") -> MTP | None:
     """The MTP layer on the GPU, packed like the model's own layers, or None if the checkpoint has none."""
 
+    from tensorfold.families.qwen3_5.cuda.exl3_load import quant_config
     from tensorfold.families.qwen3_5.cuda.qmm_fast import tile
 
+    if quant_config(Path(model_dir)) is not None and not (Path(model_dir) / MTP_FILE).is_file():
+        from .exl3 import load_mtp as load_exl3_mtp      # an EXL3 pack's own MTP layer (``mtp.*`` groups)
+
+        return load_exl3_mtp(model_dir, w, device)
     raw = mtp_tensors(model_dir)
     if raw is None:
         return None

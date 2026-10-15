@@ -45,7 +45,8 @@ class Qwen36Engine:
     """``eos``, ``generate`` and ``context_window`` for ``tensorfold.cuda.server``; ``streams`` > 1 decodes that many requests together."""
 
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
-                 context: int | None = None, context_explicit: bool | None = None, streams: int = 1) -> None:
+                 context: int | None = None, context_explicit: bool | None = None, streams: int = 1,
+                 keep: int | None = None) -> None:
         import torch
 
         from tensorfold.cuda.capacity import admit
@@ -53,21 +54,28 @@ class Qwen36Engine:
         from tensorfold.cuda.markers import resume_points
         from tensorfold.cuda.streams import PrefixCache
 
+        from tensorfold.families.qwen3_5.cuda.exl3_load import quant_config
+
         from .mtp import Head
         from .weights import MTP_FILE, load, load_mtp
 
         torch.cuda.set_device(0)
         self.depth, self.confidence = int(depth), float(confidence)
         many = streams > 1
+        keep_many = KEEP_MANY if keep is None else max(1, int(keep))   # --checkpoint-slots: each kept state is admitted
         if many:             # streams' caches of many sizes come and go: growable segments, less slack
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         extra = (Path(model_dir) / MTP_FILE,) if self.depth and (Path(model_dir) / MTP_FILE).is_file() else ()
         # one admission for one stream or many (every stream's states and caches, kept prompt ends), before any load
-        geometry = ((lambda text: stream_geometry(text, streams, KEEP_MANY, self.depth)) if many else
+        geometry = ((lambda text: stream_geometry(text, streams, keep_many, self.depth)) if many else
                     (lambda text: gdn_geometry(text, 1, self.depth + 1, mtp=self.depth > 0)))
-        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry,
-                                   lambda name, info: (mtp_weights(name, info) if ".mtp." in name
-                                                       else linear_weights(name, info)),
+        transform = lambda name, info: (mtp_weights(name, info) if ".mtp." in name          # noqa: E731
+                                        else linear_weights(name, info))
+        if quant_config(Path(model_dir)) is not None:      # an EXL3 pack: its tensors as stored, the experts' scratch
+            from .exl3 import admission
+
+            geometry, transform = admission(geometry, self.depth)
+        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry, transform,
                                    extra_files=extra)
         self.context_window = self.capacity_plan["context_window"]
         self.w = load(model_dir)
@@ -97,12 +105,13 @@ class Qwen36Engine:
             from .multi import MultiDecoder
 
             self.multi = MultiDecoder(self.w, self.head, depth=self.depth, confidence=self.confidence,
-                                      context=self.capacity_plan["cache_slots"], keep=KEEP_MANY, points=self.points,
+                                      context=self.capacity_plan["cache_slots"], keep=keep_many, points=self.points,
                                       graphs=self.graphs)
             started = time.perf_counter()
             self.multi.warm(streams)
-            print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens: together, rounds run "
-                  f"eagerly; alone, in CUDA graphs; kernels warmed in {time.perf_counter() - started:.1f}s", flush=True)
+            print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens, {keep_many} prompt "
+                  f"states kept: together, rounds run eagerly; alone, in CUDA graphs; kernels warmed in "
+                  f"{time.perf_counter() - started:.1f}s", flush=True)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
 
     def _resume(self, prompt: list[int]):
