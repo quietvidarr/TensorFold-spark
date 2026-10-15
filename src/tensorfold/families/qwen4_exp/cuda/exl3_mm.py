@@ -154,7 +154,80 @@ class F16:
                                                    BLOCK=256, num_warps=2)
         return out
 
-    prefill = __call__
+    def prefill(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """A prompt piece in one launch of 64-row tiles over the whole K (the 128-row decode tiling launched ~16
+        kernels a matrix a piece): fixed tiles and K order, so a row is still its own."""
+
+        m = x.shape[0]
+        if m <= ROWS or out.stride(-1) != 1 or self.k % PROMPT_BK:
+            return self(x, out)
+        if x.stride(1) != 1 or x.shape[1] != self.k:
+            raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
+        bm, bn, bk, stages = prompt_tiles(self.n, self.k)
+        grid = (triton.cdiv(m, bm), triton.cdiv(self.n, bn), 1)
+        _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, KS=self.k, BM=bm, BN=bn, BK=bk,
+                      F32=False, num_warps=4, num_stages=stages)
+        return out
+
+
+PROMPT_BK = 32                                    # F16.prefill: K must split in it
+
+
+def prompt_tiles(n: int, k: int) -> tuple[int, int, int, int]:
+    """F16.prefill's (rows, columns, K step, stages) for an (n, k) matrix, a function of the shape only (tuned on
+    GB10 at Flash Next's shapes: the hyper-connections' 10240 -> 324 and 320 -> 10240, the DeltaNet in_proj_a/b)."""
+
+    if n <= 128:
+        return 128, 32, 32, 4
+    if k >= 4096:
+        return 128, 128, 32, 3
+    return 128, 128, 64 if k % 64 == 0 else 32, 4
+
+
+@triton.jit
+def _upmix_f16(X, W, NORMED, MIXED, XS, M, x_stride, K: tl.constexpr, D: tl.constexpr, S: tl.constexpr,
+               BM: tl.constexpr, BD: tl.constexpr, BK: tl.constexpr):
+    """Program (m block, d block): the hyper-connection's up projection for the S streams' columns s D + d, each
+    rounded to bf16 as F16.prefill stores it, then glue.hc_mix's arithmetic on it: mixed and its 32-group sums. The
+    up rows are never written."""
+
+    pm = tl.program_id(0)
+    pd = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    dd = pd * BD + tl.arange(0, BD)
+    rk = tl.arange(0, BK)
+    ok = rm < M
+    total = tl.zeros((BM, BD), dtype=tl.float32)
+    for s in tl.static_range(S):
+        acc = tl.zeros((BM, BD), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=ok[:, None], other=0.0)
+            w = tl.load(W + (s * D + dd)[:, None] * K + (k0 + rk)[None, :])
+            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
+        u = acc.to(tl.bfloat16).to(tl.float32)
+        n = tl.load(NORMED + rm[:, None] * (S * D) + s * D + dd[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+        total += ((1.0 / (1.0 + tl.exp(-u))).to(tl.bfloat16).to(tl.float32) * n).to(tl.bfloat16).to(tl.float32)
+    m = (total / S).to(tl.bfloat16)
+    tl.store(MIXED + rm[:, None] * D + dd[None, :], m, mask=ok[:, None])
+    sums = tl.sum(tl.reshape(m.to(tl.float32), (BM, BD // 32, 32)), axis=2)
+    tl.store(XS + rm[:, None] * (D // 32) + pd * (BD // 32) + tl.arange(0, BD // 32)[None, :], sums,
+             mask=ok[:, None])
+
+
+def upmix_f16(act: torch.Tensor, up: "F16", normed: torch.Tensor, mixed: torch.Tensor, xs: torch.Tensor,
+              streams: int) -> bool:
+    """A prompt piece's hyper-connection up projection and mix in one kernel (EXL3's fp16 up matrix [S D, low]);
+    False when the shapes do not fit (the caller runs F16.prefill and glue.hc_mix)."""
+
+    m, k = act.shape
+    d = up.n // streams
+    bm, bd, bk = 64, 64, 64
+    if up.n != streams * d or k != up.k or k % bk or d % bd or act.stride(1) != 1 or not normed.is_contiguous() \
+            or not mixed.is_contiguous():
+        return False
+    _upmix_f16[(triton.cdiv(m, bm), d // bd)](act, up.w, normed, mixed, xs, m, act.stride(0), K=k, D=d, S=streams,
+                                              BM=bm, BD=bd, BK=bk, num_warps=4, num_stages=3)
+    return True
 
 
 @dataclass

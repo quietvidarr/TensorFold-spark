@@ -49,7 +49,9 @@ def build_kernels(*, exl3: bool = False, nvfp4: bool = False, solo: bool = True)
         from tensorfold.cuda.exl3 import experts as x3experts
         from tensorfold.cuda.exl3 import linear as x3linear
 
-        loaders += [x3experts._ext, x3linear._ext]
+        from .exl3_pack import _native_reader
+
+        loaders += [x3experts._ext, x3linear._ext, _native_reader]
     for load in loaders:
         load()
 
@@ -111,7 +113,9 @@ class FlashNextEngine:
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
-        rows0 = chunk or PREFILL_ROWS
+        from .exl3_pack import PROMPT_ROWS
+
+        rows0 = chunk or (PROMPT_ROWS if exl3 else PREFILL_ROWS)
         geometry = ((lambda text: indexed_stream_geometry(text, streams + int(graphs and mtp), each, KEEP, mtp=mtp,
                                                           kv_bits=bits, world=tp, prefill_rows=rows0))
                     if streams > 1 else
@@ -127,7 +131,7 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
-        self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+        self.prefill_rows, prompt_workspace = (PROMPT_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
             fp8=prompt_precision.fp8())
         if prompt_workspace:

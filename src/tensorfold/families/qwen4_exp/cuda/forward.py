@@ -53,7 +53,11 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
              inject_out, h: torch.Tensor, branch=None, y=None, wts=None) -> None:
     """Write the pending branch back into the streams h (in place), then the hyper-connection's read-out: b.mixed [R, D] (+ group sums), and its inject gates into ``inject_out``."""
 
-    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, qmm.Q4):
+    from .exl3_mm import F16
+
+    # the write-back and the norm in one kernel (byte-checked against the two once a device): the MLX matrices'
+    # prompts, and an EXL3 pack's (its hyper-connection matrices are fp16), whose read-out then skips the norm
+    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, (qmm.Q4, F16)):
         fused = _hc_fuser(h.device)
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
@@ -113,6 +117,11 @@ def _readout_plain(hc: HC, b: Buffers, h: torch.Tensor, R: int, eps: float, stre
         if upmix is not None:
             upmix(b.act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams)
             return
+    if b.prefill and R > FUSED_ROWS:                  # an EXL3 pack's fp16 up matrix: up and mix in one kernel
+        from .exl3_mm import F16, upmix_f16
+
+        if isinstance(hc.up, F16) and upmix_f16(b.act[:R], hc.up, b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams):
+            return
     _mm(b.act[:R], hc.prefill_up if b.prefill else hc.up, b.xs_act[:R], b.up[:R], b)
     glue.hc_mix(b.up[:R], b.normed[:R], b.mixed[:R], b.xs_mixed[:R], streams)
 
@@ -123,8 +132,8 @@ def _down_act(hc: HC, b: Buffers, R: int, streams: int, low: int, inject) -> Non
     out = b.dn[:R] if hc.down.n == b.dn.shape[1] else b.dn_mix[:R]
     if isinstance(hc.down, qmm.Q4):
         got = _mm(b.normed[:R], hc.prefill_down if b.prefill else hc.down, b.xs_normed[:R], out, b, reduce=False)
-    elif b.prefill:                                   # an EXL3 pack's fp16 matrix: summed slices, any row count
-        got = hc.down(b.normed[:R], out)
+    elif b.prefill:                                   # an EXL3 pack's fp16 matrix: its prompt path, any row count
+        got = hc.down.prefill(b.normed[:R], out)
     else:
         got = hc.down.partials(b.normed[:R])          # fp32 slices [SK, R, N] that the activation sums in order
     if got.dim() == 3:
@@ -317,15 +326,18 @@ def stage_ple_rows(p, b: Buffers, ids: np.ndarray, at: int = 0, got=None) -> Non
     b.ple_b[rows].copy_(b.ple_hb[rows].view(torch.bfloat16), non_blocking=True)
 
 
-def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
-    """Routed experts + the shared expert. Returns the pending write-back: (2, slots y, weights) on one GPU, (3, gathered fp32 partials, None) across ranks."""
+def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, summed: bool = False) -> tuple:
+    """Routed experts + the shared expert. Returns the pending write-back: (2, slots y, weights) on one GPU, (3, gathered fp32 partials, None) across ranks.
+
+    ``summed``: the caller takes (3, [1, R, D] fp32 weighted sum, None) as well (an EXL3 prompt piece then skips
+    writing every slot's y)."""
 
     m = layer.moe
     if getattr(m.experts, "kernel", "qmm") == "nvfp4":      # an NVFP4 checkpoint: the FP4 experts
         buf = b.moe
         nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg))
     elif w.x3 is not None:                              # an EXL3 pack: each expert at its own width, one GPU
-        return _exl3_moe(m, w, b, R)
+        return _exl3_moe(m, w, b, R, summed)
     else:
         buf = moe_mod.moe(b.mixed[:R], m.router, m.experts, b.moe, w.cfg.top_k, w.cfg.experts)
     if w.comm is None:
@@ -334,10 +346,10 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     return 3, _gather(w, b, b.part_moe, b.g_moe, R), None
 
 
-def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
+def _exl3_moe(m, w: Weights, b: Buffers, R: int, summed: bool = False) -> tuple:
     """Routed and shared experts on the grouped EXL3 kernel in windows (rows are independent); prompts keep bf16 slots."""
 
-    from tensorfold.cuda.exl3.experts import routed
+    from tensorfold.cuda.exl3.experts import prompt_kernel_fits, routed
 
     from .exl3_pack import MOE_WINDOW
 
@@ -347,9 +359,16 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
     if not b.prefill and R <= MOE_WINDOW:
         y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R)
         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
+    if R <= MOE_WINDOW:                                 # a prompt piece in one window: the prompt kernel, no copy
+        if summed and prompt_kernel_fits(m.experts):     # the weighted sum only (mode 3 rounds it as mode 2 does)
+            out = routed(b.mixed[:R], buf.pick[:R], buf.wts[:R], m.experts, w.x3.moe, w.x3.moe.y[:R], R,
+                         prompt=True, summed=True)
+            return 3, out.view(1, R, -1), None
+        y = routed(b.mixed[:R], buf.pick[:R], None, m.experts, w.x3.moe, None, R, prompt=True)
+        return 2, y.view(R, buf.slots, -1), buf.wts[:R]
     for r0 in range(0, R, MOE_WINDOW):
         n = min(MOE_WINDOW, R - r0)
-        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n)
+        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n, prompt=True)
         buf.y[r0:r0 + n].copy_(y.view(n, buf.slots, -1))
     return 2, buf.y[:R], buf.wts[:R]
 
@@ -395,7 +414,7 @@ def layer_forward(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R:
     """One decoder layer on b.h[:R]; ``pending`` = the previous MoE's (mode, branch, weights, inject) or None. Returns the new pending write-back."""
 
     _pre_moe(layer, w, segs, b, R, pending, mtp=mtp, context=context, cuts=cuts)
-    moe_mode, a, wts = moe_block(layer, w, b, R)
+    moe_mode, a, wts = moe_block(layer, w, b, R, summed=b.prefill)
     return (moe_mode, a, wts, b.inj_m)
 
 
@@ -472,7 +491,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
                 st.ple_last = (st.ple_history, toks)
                 lookups.append((p, ids, a0 * (ids.size // len(toks))))
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
+    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if stage_ahead() else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
@@ -480,7 +499,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
         if w.x3 is not None:
             from .exl3_pack import stage_ple
 
-            stage_ple(p.table, w.x3, ids, at=at)
+            stage_ple(p.table, w.x3, ids, at=at, rows=None if ahead is None else ahead[i])
         else:
             stage_ple_rows(p, b, ids, at=at, got=None if ahead is None else ahead[i])
     b.staged.record()

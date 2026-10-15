@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "experts_grouped.cuh"
+#include "experts_prefill.cuh"
 
 namespace {
 
@@ -69,6 +70,79 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
         for (; j < maxm; ++j) members[place * maxm + j] = -1;
         ++place;
     }
+}
+
+// Grouping for any number of rows (the prompt path), in three launches: counts per expert, a scan that numbers the
+// used experts in id order, then each pick's slot in its expert's list. A list's order varies between runs, which
+// changes nothing: every member's sums are its own. Lists end with -1 up to the next pass boundary (PASS).
+__global__ void group_count_kernel(const int* __restrict__ pick, int* __restrict__ counts, int n, int E) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int e = pick[i];
+        if (e >= 0 && e < E) atomicAdd(counts + e, 1);
+    }
+}
+
+__global__ void __launch_bounds__(GROUP_THREADS) group_scan_kernel(int* __restrict__ counts, int* __restrict__ slot_of,
+                                                                   int* __restrict__ uids, int* __restrict__ ucount,
+                                                                   int* __restrict__ members, int* __restrict__ work,
+                                                                   int E, int maxm, int pass) {
+    __shared__ int tot_used[GROUP_THREADS / 32], tot_pass[GROUP_THREADS / 32];
+    int used = 0, passes = 0, cnt[GROUP_PER_THREAD];
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int e = threadIdx.x * GROUP_PER_THREAD + q;
+        cnt[q] = e < E ? counts[e] : 0;
+        used += cnt[q] > 0;
+        passes += (cnt[q] + pass - 1) / pass;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int inc = used, incp = passes;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int v = __shfl_up_sync(0xffffffffu, inc, o), vp = __shfl_up_sync(0xffffffffu, incp, o);
+        if (lane >= o) { inc += v; incp += vp; }
+    }
+    if (lane == 31) { tot_used[warp] = inc; tot_pass[warp] = incp; }
+    __syncthreads();
+    if (warp == 0) {
+        int v = tot_used[lane], sum = v, vp = tot_pass[lane], sump = vp;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            int x = __shfl_up_sync(0xffffffffu, sum, o), xp = __shfl_up_sync(0xffffffffu, sump, o);
+            if (lane >= o) { sum += x; sump += xp; }
+        }
+        tot_used[lane] = sum - v;
+        tot_pass[lane] = sump - vp;
+        if (lane == 31) { ucount[0] = sum; work[0] = sump; }
+    }
+    __syncthreads();
+    int place = tot_used[warp] + inc - used, first = tot_pass[warp] + incp - passes;
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int e = threadIdx.x * GROUP_PER_THREAD + q;
+        if (e >= E) continue;
+        if (cnt[q] == 0) { slot_of[e] = -1; continue; }
+        uids[place] = e;
+        slot_of[e] = place;
+        work[1 + place] = first;                         // the expert's first work item (one pass each)
+        first += (cnt[q] + pass - 1) / pass;
+        counts[e] = 0;                                   // the cursor for the scatter
+        const int end = min(maxm, (cnt[q] / pass + 1) * pass);
+        for (int j = cnt[q]; j < end; ++j) members[(size_t)place * maxm + j] = -1;
+        ++place;
+    }
+}
+
+__global__ void group_scatter_kernel(const int* __restrict__ pick, int* __restrict__ cursor,
+                                     const int* __restrict__ slot_of, int* __restrict__ members, int n, int slots,
+                                     int E, int maxm) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int e = pick[i];
+    if (e < 0 || e >= E) return;
+    const int at = atomicAdd(cursor + e, 1);
+    if (at < maxm) members[(size_t)slot_of[e] * maxm + at] = (i / slots) * 32 + (i % slots);
 }
 
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
@@ -191,6 +265,9 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
 }
 
 // down_epilogue_kernel then combine_kernel in one launch, the same arithmetic in the same order (the same bits).
+// WY: also write each slot's y (the decode path's down_combine); without it (the prompt path's down_sum) only the
+// weighted sum is written and a slot without a routed expert adds nothing.
+template <bool WY>
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                     const half* __restrict__ svh_d, float* __restrict__ y,
                                     const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
@@ -214,11 +291,11 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
-            y[(size_t)p * D + n + j] = o[j];
+            if constexpr (WY) y[(size_t)p * D + n + j] = o[j];
         }
     } else {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) o[j] = y[(size_t)p * D + n + j];
+        for (int j = 0; j < 4; ++j) o[j] = WY ? y[(size_t)p * D + n + j] : 0.f;
     }
     part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
     __syncthreads();
@@ -244,6 +321,9 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void prefill_launch<0>(const PrefillArgs&, cudaStream_t);
+extern template void prefill_launch<1>(const PrefillArgs&, cudaStream_t);
+extern template void prefill_launch<2>(const PrefillArgs&, cudaStream_t);
 extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
@@ -277,6 +357,41 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void exl3x_prefill_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                        const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                        const at::Tensor& members, const at::Tensor& work, at::Tensor& Z, int64_t mats, int64_t K,
+                        int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t max_work,
+                        const at::Tensor* xr, int64_t xr_stride, const at::Tensor* suh0, const at::Tensor* suh1) {
+    TORCH_CHECK(K % tf_exl3x::PF_BKMAX == 0 && N % tf_exl3x::PF_COLS == 0, "prefill experts: K must split in ",
+                tf_exl3x::PF_BKMAX, " and N in ", tf_exl3x::PF_COLS);
+    tf_exl3x::PrefillArgs a;
+    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
+    a.tp0 = TP0.data_ptr<int64_t>();
+    a.tp1 = TP1.data_ptr<int64_t>();
+    a.k2_0 = B0.data_ptr<int>();
+    a.k2_1 = B1.data_ptr<int>();
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.work = work.data_ptr<int>();
+    a.z = Z.data_ptr<float>();
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.nexp_max = (int)max_work; a.mats = (int)mats; a.lo = (int)lo; a.hi = (int)hi;
+    if (xr) {
+        a.xr = reinterpret_cast<const __nv_bfloat16*>(xr->data_ptr());
+        a.xr_stride = (int)xr_stride;
+        a.suh0 = reinterpret_cast<const half*>(suh0->data_ptr());
+        a.suh1 = reinterpret_cast<const half*>(suh1->data_ptr());
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cb == 0) tf_exl3x::prefill_launch<0>(a, stream);
+    else if (cb == 1) tf_exl3x::prefill_launch<1>(a, stream);
+    else if (cb == 2) tf_exl3x::prefill_launch<2>(a, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t N, int64_t k2, int64_t cb) {
     auto stream = at::cuda::getCurrentCUDAStream();
     auto t = reinterpret_cast<const uint32_t*>(T.data_ptr());
@@ -306,6 +421,25 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
         (int)slots, (int)E, (int)members.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_group_any_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members,
+                          at::Tensor& counts, at::Tensor& slot_of, at::Tensor& work, int64_t R, int64_t slots,
+                          int64_t E, int64_t pass) {
+    TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
+    TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int n = (int)(R * slots);
+    C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int>(), 0, sizeof(int) * E, stream));
+    group_count_kernel<<<(n + 255) / 256, 256, 0, stream>>>(pick.data_ptr<int>(), counts.data_ptr<int>(), n, (int)E);
+    group_scan_kernel<<<1, GROUP_THREADS, 0, stream>>>(counts.data_ptr<int>(), slot_of.data_ptr<int>(),
+                                                       uids.data_ptr<int>(), ucount.data_ptr<int>(),
+                                                       members.data_ptr<int>(), work.data_ptr<int>(), (int)E,
+                                                       (int)members.size(1), (int)pass);
+    group_scatter_kernel<<<(n + 255) / 256, 256, 0, stream>>>(pick.data_ptr<int>(), counts.data_ptr<int>(),
+                                                              slot_of.data_ptr<int>(), members.data_ptr<int>(), n,
+                                                              (int)slots, (int)E, (int)members.size(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -363,9 +497,19 @@ void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
                              int64_t slots, int64_t E) {
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
-    down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
+    down_combine_kernel<true><<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
         y.data_ptr<float>(), wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E,
         (int)slots);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_down_sum_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, const at::Tensor& wts,
+                         at::Tensor& out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E) {
+    TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    down_combine_kernel<false><<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
+        Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()), nullptr,
+        wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E, (int)slots);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

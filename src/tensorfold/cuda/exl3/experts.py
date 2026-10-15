@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -26,7 +27,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -159,6 +160,10 @@ class Scratch:
         self.y = torch.zeros((P, D), dtype=torch.float32, device=device)
         maxu = min(P, ex.count)
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
+        # the prompt path's grouping (``group_any``): per-expert counts, list slots and its work list
+        self.counts = torch.zeros((ex.count,), dtype=torch.int32, device=device)
+        self.slot_of = torch.zeros((ex.count,), dtype=torch.int32, device=device)
+        self.work = torch.zeros((ex.count + 1,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
@@ -170,10 +175,24 @@ class Scratch:
         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
 
 
+PREFILL_COLS, PREFILL_K, PREFILL_PASS = 320, 128, 128   # the prompt kernel's column strip, K split and members a program
+
+
+def prompt_kernel_fits(ex: Exl3RoutedExperts) -> bool:
+    """The prompt kernel's shapes: gate/up and down split in its column strips and K steps."""
+
+    D, I = ex.dims, ex.width
+    return D % PREFILL_K == 0 and I % PREFILL_K == 0 and I % PREFILL_COLS == 0 and D % PREFILL_COLS == 0
+
+
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
+           group: bool = True, prompt: bool = False, summed: bool = False) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
+
+    ``prompt``: a prompt window through the prompt kernel (each decoded weight tile against every member of its
+    expert, the K sums in one order) when the shapes fit; same results to fp32 rounding, a row still its own.
+    ``summed`` (with ``prompt``, ``wts`` and ``out``): only the weighted sum is written, not each slot's y."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -182,6 +201,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
+    if prompt and prompt_kernel_fits(ex):
+        return _routed_prompt(x, pick, wts, ex, s, out, R, limit, act_mode, ids, members, summed)
     if group:
         ext.group(pick, ids, s.count, members, R, slots, E)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
@@ -199,6 +220,36 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
     ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    return out
+
+
+def _routed_prompt(x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, act_mode: int, ids,
+                   members, summed: bool = False) -> torch.Tensor:
+    ext = _ext()
+    D, I, E = ex.dims, ex.width, ex.count
+    slots = s.slots
+    P = R * slots
+    most = P // PREFILL_PASS + min(P, E)              # work items: passes of every expert's members
+    ext.group_any(pick, ids, s.count, members, s.counts, s.slot_of, s.work, R, slots, E, PREFILL_PASS)
+    if x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0:   # rotated in the kernel
+        ext.prefill_rot(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
+                        s.count, members, s.work, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], most)
+    else:
+        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+        ext.prefill(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.work, s.z, 2,
+                    D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], most)
+    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1, slots, E, float(limit), act_mode)
+    ext.prefill(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.work, s.z, 1, I,
+                D, P, slots, ex.cb, ex.k2_d[0], ex.k2_d[1], most)
+    if wts is None:
+        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, 1, slots, E)
+        return s.y[:P]
+    if out is None:
+        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    if summed:
+        ext.down_sum(s.z, pick, ex.svh_d, wts, out, R, P, D, 1, slots, E)
+    else:
+        ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, 1, slots, E)
     return out
 
 

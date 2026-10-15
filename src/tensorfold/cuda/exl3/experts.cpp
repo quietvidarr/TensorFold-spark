@@ -5,7 +5,13 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t);
+void exl3x_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                        const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                        at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                        const at::Tensor*, int64_t, const at::Tensor*, const at::Tensor*);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3x_group_any_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+                          at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
@@ -15,6 +21,8 @@ void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::
 void exl3x_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
                               int64_t, int64_t, int64_t, int64_t);
 void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+void exl3x_down_sum_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
                              at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
@@ -44,6 +52,55 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
                        pf, lo, hi);
 }
 
+// The prompt path: every member of an expert against each decoded weight tile once; Z gets one split [mats, P, N].
+void prefill(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+             const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+             const at::Tensor& members, const at::Tensor& work, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
+             int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t max_work) {
+    check(work, at::kInt, "work");
+    check(X0, at::kHalf, "X0");
+    check(X1, at::kHalf, "X1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
+    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3x_prefill_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, work, Z, mats, K, N, P, slots, cb, lo, hi,
+                       max_work, nullptr, 0, nullptr, nullptr);
+}
+
+// prefill with the gate/up inputs rotated in the kernel: xr [rows, K] bf16 (row stride xr_stride) and the experts'
+// suh [E, K] fp16 for gate and up, rot_in's arithmetic bit for bit (no X0 / X1 per slot)
+void prefill_rot(const at::Tensor& xr, int64_t xr_stride, const at::Tensor& suh0, const at::Tensor& suh1,
+                 const at::Tensor& TP0, const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                 const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& work,
+                 at::Tensor Z, int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi,
+                 int64_t max_work) {
+    TORCH_CHECK(xr.is_cuda() && xr.scalar_type() == at::kBFloat16 && xr.stride(1) == 1 && xr_stride % 4 == 0,
+                "xr: bf16 rows, 8-byte aligned");
+    check(suh0, at::kHalf, "suh0");
+    check(suh1, at::kHalf, "suh1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(work, at::kInt, "work");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(Z.numel() >= 2 * P * N, "Z too small");
+    c10::cuda::CUDAGuard guard(xr.device());
+    exl3x_prefill_cuda(suh0, suh0, TP0, TP1, B0, B1, uids, ucount, members, work, Z, 2, K, N, P, slots, cb, lo, hi,
+                       max_work, &xr, xr_stride, &suh0, &suh1);
+}
+
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
     TORCH_CHECK(T.is_cuda() && T.scalar_type() == at::kShort && T.is_contiguous() && T.dim() == 3,
                 "T: int16 [K/16, N/16, 8 * k2]");
@@ -53,6 +110,24 @@ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
     TORCH_CHECK(out.numel() == K * N, "out must be [K, N]");
     c10::cuda::CUDAGuard guard(T.device());
     exl3x_dequant_cuda(T, out, K, N, k2, cb);
+}
+
+// group for any R (the prompt path); counts and slot_of: int32 [E] scratch; lists padded with -1 to a pass of `pass`
+// work: int32 [E + 1], set to (passes in all, then each used expert's first pass) for ``prefill``
+void group_any(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, at::Tensor counts,
+               at::Tensor slot_of, at::Tensor work, int64_t R, int64_t slots, int64_t E, int64_t pass) {
+    check(work, at::kInt, "work");
+    TORCH_CHECK(work.numel() >= E + 1, "work needs E + 1 entries");
+    check(pick, at::kInt, "pick");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(counts, at::kInt, "counts");
+    check(slot_of, at::kInt, "slot_of");
+    TORCH_CHECK(counts.numel() >= E && slot_of.numel() >= E, "counts / slot_of need E entries");
+    TORCH_CHECK(members.dim() == 2 && members.size(1) >= R * slots / std::max<int64_t>(1, E) && pass > 0, "members");
+    c10::cuda::CUDAGuard guard(pick.device());
+    exl3x_group_any_cuda(pick, uids, ucount, members, counts, slot_of, work, R, slots, E, pass);
 }
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
@@ -115,6 +190,18 @@ void combine(const at::Tensor& y, const at::Tensor& wts, at::Tensor out, int64_t
     exl3x_combine_cuda(y, wts, out, rows, D, slots);
 }
 
+// down_combine without the per-slot y: out [rows, D] fp32 = the slots' weighted sum (the prompt path)
+void down_sum(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, const at::Tensor& wts,
+              at::Tensor out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E) {
+    check(Z, at::kFloat, "Z");
+    check(pick, at::kInt, "pick");
+    check(wts, at::kFloat, "wts");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kFloat && out.stride(1) == 1 && out.stride(0) == D,
+                "out: fp32 [rows, D] rows");
+    c10::cuda::CUDAGuard guard(Z.device());
+    exl3x_down_sum_cuda(Z, pick, svh_d, wts, out, rows, P, D, SK, slots, E);
+}
+
 void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor y,
                   const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots,
                   int64_t E) {
@@ -131,11 +218,15 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
+    m.def("prefill", &prefill);
+    m.def("prefill_rot", &prefill_rot);
     m.def("dequant", &dequant);
     m.def("group", &group);
+    m.def("group_any", &group_any);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
     m.def("combine", &combine);
     m.def("down_combine", &down_combine);
+    m.def("down_sum", &down_sum);
 }

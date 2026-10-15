@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,20 @@ import torch
 from tensorfold.cuda.exl3.format import is_exl3  # noqa: F401  (exl3.py and engine.py import it from here)
 
 EXTRA_FILES = ("ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors")
-MOE_WINDOW = 1024        # most rows a routed-expert call takes (its grouping keeps every pick in 48 KB of shared memory)
+NGRAM_READ = "TF_EXL3_NGRAM_READ"         # "pread" (default): parallel reads of each step's unique rows; "mmap": page faults
+NGRAM_READERS = "TF_EXL3_NGRAM_READERS"   # reads in flight at once (default 32): os.preadv releases the GIL
+NGRAM_MAX_READ = 1 << 20                  # bytes one read of adjacent rows may cover
+def _prompt_rows() -> int:
+    rows = int(os.environ.get("TF_EXL3_PROMPT_ROWS", "2048"))
+    if rows < 512 or rows % 64:
+        raise ValueError(f"TF_EXL3_PROMPT_ROWS={rows}: a multiple of 64, at least 512")
+    return rows
+
+
+# An EXL3 pack's prompt pieces (rows): each piece reads every routed expert's weights once, so larger pieces read
+# them less often per token (4096 vs 2048: ~0.7 GB less a piece, ~1.5 GB more scratch). TF_EXL3_PROMPT_ROWS sets it.
+PROMPT_ROWS = _prompt_rows()
+MOE_WINDOW = PROMPT_ROWS  # most rows a routed-expert call takes: a whole prompt piece in one prompt-kernel call
 _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "I64": torch.int64, "I32": torch.int32,
        "I16": torch.int16, "U8": torch.uint8, "I8": torch.int8, "U16": torch.int16, "U32": torch.int32}
 
@@ -27,9 +41,9 @@ def extra_files(model_dir: str | Path) -> tuple[Path, ...]:
 def admission(geometry):
     """The engine's geometry plus the EXL3 path's fixed scratch: routed-expert windows and prompt rows."""
 
-    from tensorfold.cuda.geometry import PREFILL_ROWS, exl3_indexed_scratch, with_fixed
+    from tensorfold.cuda.geometry import exl3_indexed_scratch, with_fixed
 
-    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, MOE_WINDOW, PREFILL_ROWS))
+    return lambda text: with_fixed(geometry(text), exl3_indexed_scratch(text, MOE_WINDOW, PROMPT_ROWS))
 
 
 class Pack:
@@ -142,6 +156,18 @@ class NgramTable:
         if self.bits not in range(2, 9) or 1 + self.dh * self.bits // 16 != self.words_per_row:
             raise ValueError(f"n-gram rows of {self.words_per_row} words are not one scale plus 160 values")
         self.maps = [np.memmap(pk.dir / f, dtype=np.uint8, mode="r") for f in files]
+        self.mode = os.environ.get(NGRAM_READ, "pread").strip().lower()
+        if self.mode not in ("pread", "mmap"):
+            raise ValueError(f"{NGRAM_READ}={self.mode!r}: expected pread or mmap")
+        self.readers = max(1, int(os.environ.get(NGRAM_READERS, "32")))
+        self._fds = np.array([os.open(pk.dir / f, os.O_RDONLY) for f in files], dtype=np.int64)
+        for fd in self._fds.tolist():
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)    # a row read pulls its pages, not a readahead window
+            except (OSError, AttributeError):
+                pass
+        self._pool = None
+        weakref.finalize(self, _close_reads, self._fds.tolist())
         self.fidx = np.array(fidx, dtype=np.int64)
         self.offsets = np.array(offsets, dtype=np.int64)
         self.starts = np.array(starts, dtype=np.int64)
@@ -162,6 +188,8 @@ class NgramTable:
         flat = np.asarray(ids, dtype=np.int64).reshape(-1)
         if np.any(flat < 0) or np.any(flat >= self.rows):
             raise IndexError(f"n-gram row outside [0, {self.rows})")
+        if self.mode == "pread":
+            return self._pread(flat)
         shard = np.searchsorted(self.starts, flat, side="right") - 1
         at = self.offsets[shard] + (flat - self.starts[shard]) * self.row_bytes
         where = self.fidx[shard]
@@ -171,6 +199,47 @@ class NgramTable:
             sel = np.nonzero(where == f)[0]
             out[sel] = self.maps[f][at[sel, None] + cols]
         return out.view(np.int16)
+
+    def _pread(self, flat: np.ndarray) -> np.ndarray:
+        """``gather`` by explicit reads: each unique row once, adjacent rows in one read, the reads in parallel.
+
+        Mapped rows fault in one page at a time on one thread, so a table that is not in the page cache stalls
+        every step on the SSD's latency; parallel reads keep the SSD's queue full instead. Same bytes either way."""
+
+        unique, inverse = np.unique(flat, return_inverse=True)
+        shard = np.searchsorted(self.starts, unique, side="right") - 1
+        at = self.offsets[shard] + (unique - self.starts[shard]) * self.row_bytes
+        where = self.fidx[shard]
+        width = self.row_bytes
+        out = np.empty((unique.size, width), dtype=np.uint8)
+        n = unique.size
+        if n:
+            cut = np.ones(n, dtype=bool)
+            cut[1:] = (where[1:] != where[:-1]) | (at[1:] != at[:-1] + width)
+            first = np.flatnonzero(cut)
+            cut |= (np.arange(n) - first[np.cumsum(cut) - 1]) % max(1, NGRAM_MAX_READ // width) == 0
+            first = np.flatnonzero(cut)
+            count = np.diff(first, append=n)
+            native = _native_reader()
+            if native is not None:                    # the runs in native threads, without the interpreter
+                native.pread_runs(torch.from_numpy(np.ascontiguousarray(self._fds[where[first]])),
+                                  torch.from_numpy(np.ascontiguousarray(at[first])),
+                                  torch.from_numpy(count * width), torch.from_numpy(first * width),
+                                  int(out.ctypes.data), self.readers)
+                return out[inverse].view(np.int16)
+            view = memoryview(out.reshape(-1))
+            reads = list(zip(self._fds[where[first]].tolist(), at[first].tolist(), (count * width).tolist(),
+                             (first * width).tolist()))
+            batches = min(self.readers, len(reads))
+            if batches > 1:
+                if self._pool is None:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self._pool = ThreadPoolExecutor(self.readers, thread_name_prefix="exl3-ngram")
+                list(self._pool.map(_preadv_all, [(reads[i::batches], view) for i in range(batches)]))
+            else:
+                _preadv_all((reads, view))
+        return out[inverse].view(np.int16)
 
     def lock(self) -> bool:
         if os.name == "nt":
@@ -200,10 +269,54 @@ class NgramTable:
         return HostTable.prefetch(self, workers)
 
 
-def stage_ple(table: NgramTable, sc, ids: np.ndarray, at: int = 0) -> None:
-    """Copy the rows' packed n-gram entries into the shared staging buffers from row ``at``."""
+_NATIVE = []
 
-    rows = table.gather(ids)
+
+def _native_reader():
+    """The native run reader (ngram_read.cpp), built with the engine's kernels; None (the Python loop) if it cannot
+    build or TF_EXL3_NGRAM_NATIVE=0."""
+
+    if not _NATIVE:
+        got = None
+        if os.environ.get("TF_EXL3_NGRAM_NATIVE", "1") != "0":
+            try:
+                from tensorfold.cuda.build import load
+
+                got = load(name="tensorfold_ngram_read_v1", sources=[str(Path(__file__).with_name("ngram_read.cpp"))],
+                           extra_cflags=["-O2"], verbose=False)
+            except Exception as error:                # noqa: BLE001  the Python loop reads the same bytes
+                print(f"[tensorfold] n-gram native reader unavailable ({error}); reading in Python", flush=True)
+        _NATIVE.append(got)
+    return _NATIVE[0]
+
+
+def _close_reads(fds: list[int]) -> None:
+    """Close the table's read descriptors (finalizer; the pool's idle threads exit with the interpreter)."""
+
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _preadv_all(job: tuple[list[tuple[int, int, int, int]], memoryview]) -> None:
+    """Each (fd, file offset, bytes, offset in ``view``) read in full; end of file means the pack changed."""
+
+    reads, view = job
+    for fd, offset, size, to in reads:
+        done = 0
+        while done < size:
+            got = os.preadv(fd, [view[to + done:to + size]], offset + done)
+            if got <= 0:
+                raise OSError(f"short read of the n-gram table at byte {offset + done}: the pack changed")
+            done += got
+
+
+def stage_ple(table: NgramTable, sc, ids: np.ndarray, at: int = 0, rows: np.ndarray | None = None) -> None:
+    """Copy the rows' packed n-gram entries into the shared staging buffers from row ``at`` (``rows``: read ahead)."""
+
+    rows = table.gather(ids) if rows is None else rows
     n = rows.shape[0]
     sc.ple_host[at:at + n].numpy()[:] = rows
     sc.ple_dev[at:at + n].copy_(sc.ple_host[at:at + n], non_blocking=True)
