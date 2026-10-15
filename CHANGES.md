@@ -51,6 +51,9 @@ One commit per change on `spark`. Full diff: `git diff 609ca419 spark`.
 - Qwen3.6: graphs keyed on buffer rows
 - Qwen3.6: MoE combine writes the bf16 rows
 - Qwen3.6: conv windows read through a pointer
+- Flash: prompt cache points inside one prefill pass
+- Qwen3.6: graphs capture in thread_local mode
+- Qwen3.6: prompt cache points inside one prefill pass
 
 ## Files changed
 `*` = added, others modified.
@@ -62,5 +65,5 @@ One commit per change on `spark`. Full diff: `git diff 609ca419 spark`.
 - `src/tensorfold/families/qwen3_5_moe/`: __init__.py
 - `src/tensorfold/families/qwen3_5_moe/cuda/`: __init__.py, decode.py, disk_points.py*, engine.py, exl3.py*, graphs.py, mtp.py, multi.py, weights.py
 - `src/tensorfold/families/qwen4_exp/cuda/`: __init__.py, decode.py, disk_points.py*, engine.py, exl3.py, exl3_mm.py, exl3_pack.py, forward.py, gdn_io.cpp, gdn_io.cu, gdn_io.py, glue.py, graphs.py, hc_fused.py, hc_gemv.cu*, multi.py, multi_fill.py, multi_solo.py, ngram_read.cpp*, prefixes.py, state.py, vision_prefix.py*
-- `tests/cuda/`: test_exl3_prompt_experts.py*, test_exl3_prompt_strips.py*, test_group_kernel_smem.py, test_prefill_p3.py*, test_prompt_store.py*, test_qwen36_exl3_moe.py*
+- `tests/cuda/`: test_exl3_prompt_experts.py*, test_exl3_prompt_strips.py*, test_flashnext_prompt_cache.py, test_group_kernel_smem.py, test_prefill_p3.py*, test_prompt_store.py*, test_qwen27_prompt_end_cache.py, test_qwen36_exl3_moe.py*
 - `tests/`: test_exl3_ngram_pread.py*, test_flash_capacity_dispatch.py, test_flashnext_round_plan.py, test_flashnext_vision_prefix.py*, test_qwen36_kept_ends.py*, test_qwen36_prompt_store.py*
