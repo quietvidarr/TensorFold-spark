@@ -1,0 +1,134 @@
+# Changes in this fork
+
+Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at `609ca419` (0.6.5), Apache-2.0.
+Changed by quietvidarr, 2026, for EXL3 models on one DGX Spark (GB10):
+Qwen3.8 Flash Next (`qwen4_exp`) and Qwen3.6-35B-A3B (`qwen3_5_moe`).
+
+- EXL3 n-gram table reads, prompt (prefill) expert kernels, decode kernels
+- Prompt cache on disk, resume points at message starts
+- Qwen3.6-35B-A3B EXL3 MoE support
+- Vision prefix cache from souf's recipe (sxuff/qwen38-flash-next-dgx-spark)
+
+One commit per patch on branch `spark`. Full diff: `git diff 609ca419 spark`.
+
+## Commits
+- Vision prefix cache for image-history prompts
+- EXL3 n-gram: parallel deduplicated reads ahead of the GPU wait
+- EXL3 prompt experts on a prefill kernel
+- EXL3 n-gram rows via a native reader
+- Tune the EXL3 prompt expert kernel
+- Flash: keep every conversation's prompt ends
+- Prompt cache on disk
+- Faster EXL3 expert kernels
+- Prompt cache: host copies off the GPU path
+- Flash: decode graphs once per slot size
+- Prompt cache points at every message start, never dropped
+- EXL3 prompt MoE kernel v2
+- EXL3 prompt: exact deterministic sum
+- Prefill prompt-path fusions
+- EXL3 linear: 32-row passes decode each weight tile once
+- Router: 17-32 rows in BLOCK_E 16 / BK 128 tiles
+- Grouped experts: PF 3/4 instantiations
+- MoE combine: optional bf16 rows
+- Grouped experts: shared program body
+- Grouped experts: plain launch bounds for the default
+- Grouped experts: persistent loop calls the program body
+- Prompt rows independent of how the prompt is split
+- Flash: copy drafting gated by the MTP head's first draft
+- Flash: hc_gemv for the fp16 decode matrices
+- Flash: hc_gemv12 for the hyper-connection matrices
+- Flash: hc12 decode windows up to 24 rows
+- Flash: hc_gemv12 launch shapes (TF_FLASH_HC12_CFG)
+- Flash: read ahead the next window's n-gram rows
+- Flash: n-gram read-ahead off by default
+- Flash: n-gram rows of every stream in one read
+- Qwen3.6-35B-A3B EXL3 MoE support
+- EXL3 prompt kernel: 256-column strips
+- Qwen3.6: keep every conversation's prompt ends
+- Qwen3.6: prompt cache on disk
+- Qwen3.6: prefill steps under concurrency
+- Qwen3.6: prompt cache host copies off the GPU path
+- Qwen3.6: prompt cache never drops, keep_rank eviction
+- Qwen3.6: prompt MoE v2 tests
+- Qwen3.6: prompt sum mode tests
+- Qwen3.6: one read-back per draft level
+- Qwen3.6: defer the GDN replay in multi-stream decode
+- Qwen3.6: one read-back per draft step
+- Qwen3.6: graphs keyed on buffer rows
+- Qwen3.6: MoE combine writes the bf16 rows
+- Qwen3.6: conv windows read through a pointer
+
+## Files changed
+- `src/tensorfold/cuda/exl3/experts.cpp` (modified)
+- `src/tensorfold/cuda/exl3/experts.cu` (modified)
+- `src/tensorfold/cuda/exl3/experts.py` (modified)
+- `src/tensorfold/cuda/exl3/experts_cb0.cu` (modified)
+- `src/tensorfold/cuda/exl3/experts_cb1.cu` (modified)
+- `src/tensorfold/cuda/exl3/experts_cb2.cu` (modified)
+- `src/tensorfold/cuda/exl3/experts_grouped.cuh` (modified)
+- `src/tensorfold/cuda/exl3/experts_prefill.cuh` (added)
+- `src/tensorfold/cuda/exl3/linear.cpp` (modified)
+- `src/tensorfold/cuda/exl3/linear.cu` (modified)
+- `src/tensorfold/cuda/exl3/linear.py` (modified)
+- `src/tensorfold/cuda/exl3/prefill.py` (modified)
+- `src/tensorfold/cuda/exl3/prompt_moe.cpp` (added)
+- `src/tensorfold/cuda/exl3/prompt_moe.cu` (added)
+- `src/tensorfold/cuda/exl3/prompt_moe.cuh` (added)
+- `src/tensorfold/cuda/keep_rank.py` (added)
+- `src/tensorfold/cuda/kernels/attention.py` (modified)
+- `src/tensorfold/cuda/kernels/gdn.py` (modified)
+- `src/tensorfold/cuda/kernels/gdn_prefill.cu` (modified)
+- `src/tensorfold/cuda/markers.py` (modified)
+- `src/tensorfold/cuda/moe.py` (modified)
+- `src/tensorfold/cuda/prompt_store.py` (added)
+- `src/tensorfold/cuda/sampling.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/b16.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/exl3_load.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/forward.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/glue.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/prefill.py` (modified)
+- `src/tensorfold/families/qwen3_5/cuda/weights.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/__init__.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/__init__.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/decode.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/disk_points.py` (added)
+- `src/tensorfold/families/qwen3_5_moe/cuda/engine.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/exl3.py` (added)
+- `src/tensorfold/families/qwen3_5_moe/cuda/graphs.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/mtp.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/multi.py` (modified)
+- `src/tensorfold/families/qwen3_5_moe/cuda/weights.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/__init__.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/decode.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/disk_points.py` (added)
+- `src/tensorfold/families/qwen4_exp/cuda/engine.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/exl3.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/forward.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/gdn_io.cpp` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/gdn_io.cu` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/gdn_io.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/glue.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/graphs.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/hc_fused.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/hc_gemv.cu` (added)
+- `src/tensorfold/families/qwen4_exp/cuda/multi.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/multi_fill.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/multi_solo.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/ngram_read.cpp` (added)
+- `src/tensorfold/families/qwen4_exp/cuda/prefixes.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/state.py` (modified)
+- `src/tensorfold/families/qwen4_exp/cuda/vision_prefix.py` (added)
+- `tests/cuda/test_exl3_prompt_experts.py` (added)
+- `tests/cuda/test_exl3_prompt_strips.py` (added)
+- `tests/cuda/test_group_kernel_smem.py` (modified)
+- `tests/cuda/test_prefill_p3.py` (added)
+- `tests/cuda/test_prompt_store.py` (added)
+- `tests/cuda/test_qwen36_exl3_moe.py` (added)
+- `tests/test_exl3_ngram_pread.py` (added)
+- `tests/test_flash_capacity_dispatch.py` (modified)
+- `tests/test_flashnext_round_plan.py` (modified)
+- `tests/test_flashnext_vision_prefix.py` (added)
+- `tests/test_qwen36_kept_ends.py` (added)
+- `tests/test_qwen36_prompt_store.py` (added)
