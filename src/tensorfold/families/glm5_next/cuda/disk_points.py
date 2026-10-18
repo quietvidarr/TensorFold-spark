@@ -85,14 +85,17 @@ def capture(engine, snap, *, force: bool = False) -> bool:
     cp = store.copier
     sp = specs(engine.e.st, n, m)
     src = snap.rows if snap.rows is not None else [t[:c] for t, c, _, _ in sp]
+    # no GPU copy first: rows below a point are written again only by a later prompt's prefill, and the engine makes
+    # that wait for the copier (GlmEngine._run_once), so the side stream reads them straight from the caches
+    direct = True
     if len(src) != len(sp):
         raise ValueError("a kept snapshot's rows do not match the caches' layout")
     full = _full(n, m)
     order = [pre.block(j) for j in range(full)]
-    blocks = {h: {"t": [cp.host(v[j * B // q:(j + 1) * B // q]) for v, (_, _, q, _) in zip(src, sp)]}
+    blocks = {h: {"t": [cp.host(v[j * B // q:(j + 1) * B // q], private=direct) for v, (_, _, q, _) in zip(src, sp)]}
               for j, h in enumerate(order) if not store.has_block(h)}
     point = {"ids": torch.tensor(ids, dtype=torch.int32), "blocks": order, "pos": n, "mtp_len": snap.mtp_len,
-             "rows": [cp.host(v[full * B // q:c]) for v, (_, c, q, _) in zip(src, sp)],
+             "rows": [cp.host(v[full * B // q:c], private=direct) for v, (_, c, q, _) in zip(src, sp)],
              "rec": cp.host(snap.rec, private=True), "conv": cp.host(snap.conv, private=True),
              "pending": cp.host(snap.pending, private=True) if snap.pending is not None else None}
     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),

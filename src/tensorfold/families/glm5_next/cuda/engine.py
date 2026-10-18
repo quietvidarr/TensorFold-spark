@@ -618,6 +618,10 @@ class GlmEngine:
 
         cut = len(hit.ids) if hit is not None else 0
         self._take_over(list(hit.ids) if hit is not None else [])
+        if self.store is not None and self.store.copier.stream is not None:
+            import torch                         # earlier points' rows leave the caches before this prefill writes them
+
+            torch.cuda.current_stream().wait_stream(self.store.copier.stream)
         t_take = time.perf_counter() - t0
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit)
