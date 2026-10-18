@@ -426,7 +426,7 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
     W = tokens.shape[1]
     if ONEPASS and prompt:
         _sparse_rows[(R, triton.cdiv(H, HB_WIDE))](qa, cache, tokens, counts, out, W=W, H=H, LW=LW, SCALE=scale,
-                                                   HBT=HB_WIDE, KTT=KT, num_warps=4, num_stages=1)
+                                                   HBT=HB_WIDE, KTT=KT, num_warps=4, num_stages=5)   # 5 stages: -37%, same bits
         return
     nch = triton.cdiv(W, CHUNK)
     hb = head_block(R)              # the whole window's head block, whatever rows a launch takes: the same bits a row
