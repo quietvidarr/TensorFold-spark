@@ -21,6 +21,7 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+DEBUG_CACHE = os.environ.get("TF_GLM_CACHE_DEBUG", "0") == "1"       # per request: kept-state and disk timings
 
 
 def encode_policy(spec: str) -> list[int]:
@@ -498,9 +499,19 @@ class GlmEngine:
             self._drop(gone)
             dropped = True
         if dropped:
-            import torch
+            self._trim()
 
-            torch.cuda.empty_cache()
+    def _trim(self) -> None:
+        """Freed rows back to the GPU (upstream: at once). With our points a prefill drops many kept states one by
+        one; emptying torch's pool each time then costs a cudaFree/cudaMalloc round per point, so it waits for the
+        request's end."""
+
+        if self.points is not None or self.store is not None:
+            self.trim_later = True
+            return
+        import torch
+
+        torch.cuda.empty_cache()
 
     def _victim(self, among=None) -> int:
         """The kept snapshot to drop first: upstream the oldest; with our points ``keep_rank``'s order (a point inside
@@ -561,9 +572,7 @@ class GlmEngine:
                 continue
             save_rows(self.e, snap)
         if dropped:
-            import torch
-
-            torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+            self._trim()                         # give the freed rows back rather than keep them in torch's pool
 
     def _keep(self, snap) -> None:
         self._remember(snap)
@@ -609,6 +618,7 @@ class GlmEngine:
 
         cut = len(hit.ids) if hit is not None else 0
         self._take_over(list(hit.ids) if hit is not None else [])
+        t_take = time.perf_counter() - t0
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
@@ -625,7 +635,12 @@ class GlmEngine:
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
+        t1 = time.perf_counter()
         self._flush()                            # the points' disk copies after the first token, not before it
+        if DEBUG_CACHE:
+            print(f"[glm-cache] take_over {t_take:.3f}s prefill {prefill_s - t_take:.3f}s flush "
+                  f"{time.perf_counter() - t1:.3f}s points {keep_at if isinstance(keep_at, list) else [keep_at]} "
+                  f"kept {len(self.cache)} unsaved {len(self.unsaved)}", flush=True)
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
         policy = decode_policy(code)
@@ -710,6 +725,11 @@ class GlmEngine:
         finally:
             self.busy = False
             self.later = []
+            if getattr(self, "trim_later", False):
+                self.trim_later = False
+                import torch
+
+                torch.cuda.empty_cache()
         if self.unsaved:                               # the disk queue drained while the reply decoded
             from . import disk_points
 
