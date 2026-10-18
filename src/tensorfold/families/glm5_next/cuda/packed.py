@@ -68,6 +68,7 @@ class ProjectionScratch:
             raise ValueError('scratch rows must be positive')
         mats = [p for q in projections for p in leaves(q)]
         self.rows, self.chunk = rows, min(rows, 128)
+        self.prefill = bool(prefill)
         # a prompt chunk's EXL3 projections in one prompt GEMM (cuda/exl3/prefill.py: W_q decoded once, fixed tiles,
         # so a row's bits never depend on its window): our prefill path; TF_GLM_PROMPT_LINEAR=0 keeps 128-row windows
         import os
@@ -97,10 +98,10 @@ class ProjectionScratch:
 PROMPT_GEMM_MAX_N = 32768        # wider (the vocabulary head): its decoded W would not pay for a prompt's last rows
 
 
-def _plain_cuda(q,x,out):
+def _plain_cuda(q,x,out,prompt=False):
     # Import is lazy: CPU contracts never compile or load CUDA extensions.
     from .prefill import plain_matmul
-    return plain_matmul(q.weight,x,out)
+    return plain_matmul(q.weight,x,out,prompt=prompt)
 
 
 def matmul(q, x, out, scratch):
@@ -116,6 +117,12 @@ def matmul(q, x, out, scratch):
         return out
     if q.k>scratch.k or q.n>scratch.n:
         raise ValueError('projection exceeds preallocated scratch dimensions')
+    if (getattr(scratch, "prefill", False) and isinstance(q, PlainLinear) and x.is_cuda and x.stride(-1) == 1
+            and q.k % 64 == 0 and dst.stride(-1) == 1):
+        from .prefill import PLAIN_TC
+        if PLAIN_TC:                         # a prompt chunk's rows in one tensor-core call, not 128-row windows
+            _plain_cuda(q, x, dst, prompt=True)
+            return out
     if (getattr(scratch, "ws", None) is not None and isinstance(q, Exl3Linear) and x.is_cuda
             and q.n % 128 == 0 and q.k % 32 == 0 and q.n <= PROMPT_GEMM_MAX_N):
         from tensorfold.cuda.exl3.prefill import matmul as prompt_matmul
