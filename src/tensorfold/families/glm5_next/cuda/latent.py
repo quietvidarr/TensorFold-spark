@@ -386,14 +386,46 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
     return out
 
 
-from tensorfold.cuda.geometry import MLA_SPARSE_ATT_ROWS as SPARSE_ROWS   # rows a sparse launch takes (partials' size)
+@triton.jit
+def _sparse_rows(QA, LC, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr, SCALE: tl.constexpr,
+                 HBT: tl.constexpr, KTT: tl.constexpr):
+    """Program (row, head block): HB heads of row r over all its selected tokens in list order, one online softmax
+    (prompt chunks: no chunk partials or merge); rows with CNT 0 are left alone."""
+    r = tl.program_id(0)
+    hb = tl.program_id(1)
+    n = tl.load(CNT + r)
+    if n > 0:
+        hh = hb * HBT + tl.arange(0, HBT)
+        hok = hh < H
+        k = tl.arange(0, LW)
+        m = tl.full((HBT,), float("-inf"), tl.float32)
+        l = tl.zeros((HBT,), tl.float32)
+        o = tl.zeros((HBT, LW), tl.float32)
+        q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+        for t in range(0, tl.cdiv(n, KTT)):
+            idx = t * KTT + tl.arange(0, KTT)
+            ok = idx < n
+            tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+            kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+            m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
+        tl.store(OUT + (r * H + hh[:, None]) * LW + k[None, :], (o / l[:, None]).to(tl.bfloat16), mask=hok[:, None])
+
+
+from tensorfold.cuda.geometry import MLA_SPARSE_ATT_ROWS as SPARSE_ROWS
+# prompt chunks: one pass a row (35% faster than chunk partials + merge; fp32 softmax blocked differently, so
+# other last bits; a row's bits still its own). TF_GLM_SPARSE_ONEPASS=0: the chunked path
+ONEPASS = __import__("os").environ.get("TF_GLM_SPARSE_ONEPASS", "1") != "0"   # rows a sparse launch takes (partials' size)
 
 
 def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
-                     out: torch.Tensor, scale: float) -> None:
+                     out: torch.Tensor, scale: float, prompt: bool = False) -> None:
     """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone."""
     R, H, LW = qa.shape
     W = tokens.shape[1]
+    if ONEPASS and prompt:
+        _sparse_rows[(R, triton.cdiv(H, HB_WIDE))](qa, cache, tokens, counts, out, W=W, H=H, LW=LW, SCALE=scale,
+                                                   HBT=HB_WIDE, KTT=KT, num_warps=4, num_stages=1)
+        return
     nch = triton.cdiv(W, CHUNK)
     hb = head_block(R)              # the whole window's head block, whatever rows a launch takes: the same bits a row
     step = min(R, SPARSE_ROWS)

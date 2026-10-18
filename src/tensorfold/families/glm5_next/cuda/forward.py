@@ -440,7 +440,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+            latent.sparse_attention(qa, lc, tokens, counts, ol, scale, prompt=b.prefill)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
