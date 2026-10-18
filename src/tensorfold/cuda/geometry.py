@@ -7,9 +7,11 @@ import re
 
 from .capacity import Geometry, Weights, headers, itemsize
 
-_PREFILL_ROWS = 2048    # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
-# TF_GLM_PREFILL_ROWS (lab sweep): a GLM prompt chunk's rows (admission sizes the buffers by it), 512 to 16,384
-PREFILL_ROWS = int(__import__("os").environ.get("TF_GLM_PREFILL_ROWS", "") or _PREFILL_ROWS)
+_PREFILL_ROWS = 2048    # a prompt chunk's rows: Flash Next keeps buffers of this many rows
+# TF_GLM_PREFILL_ROWS: a GLM prompt chunk's rows (admission sizes the buffers by it), 512 to 16,384; 4096 by default
+# (each expert's and projection's weights streamed and decoded once for twice the rows: +7% prefill; the sparse
+# attention's partials stay at MLA_SPARSE_ATT_ROWS rows a launch)
+PREFILL_ROWS = int(__import__("os").environ.get("TF_GLM_PREFILL_ROWS", "") or 4096)
 if not 512 <= PREFILL_ROWS <= 16384:
     raise ValueError(f"TF_GLM_PREFILL_ROWS: 512 to 16,384, not {PREFILL_ROWS}")
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
@@ -176,7 +178,7 @@ def live_kv(t: dict, world: int, window: int) -> int:
 
 def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mtp: bool = False,
                  kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False,
-                 kept: int = 2, prefill_rows: int = PREFILL_ROWS) -> Geometry:
+                 kept: int = 2, prefill_rows: int = _PREFILL_ROWS) -> Geometry:
     """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts."""
 
     linear, attention = layer_counts(t)
@@ -425,7 +427,7 @@ def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int 
 
 
 def indexed_stream_geometry(t: dict, streams: int, each: int, keep: int, *, mtp: bool, kv_bits: int = 16,
-                            first: int = 256, prefill_rows: int = PREFILL_ROWS, world: int = 1) -> Geometry:
+                            first: int = 256, prefill_rows: int = _PREFILL_ROWS, world: int = 1) -> Geometry:
     """Flash Next's concurrent decoder on one GPU: per-row windows and kept snapshots sized to share one GPU."""
 
     linear, attention = layer_counts(t)
