@@ -162,7 +162,7 @@ PROMPT_ABSORB = __import__("os").environ.get("TF_GLM_PROMPT_ABSORB", "1") != "0"
 
 @triton.jit
 def _absorb_q_tc(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
-                 BN: tl.constexpr, BK: tl.constexpr):
+                 BN: tl.constexpr, BK: tl.constexpr, TF32: tl.constexpr):
     """Program (head, column block, row block): QA[rows, h, cols] = Q[rows, h, :] @ WK[h, :, cols]."""
     h = tl.program_id(0)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -172,13 +172,16 @@ def _absorb_q_tc(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexp
         k = k0 + tl.arange(0, BK)
         q = tl.load(Q + (r[:, None] * H + h) * D + k[None, :], mask=r[:, None] < R, other=0.0)
         w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :])
-        acc = tl.dot(q, w, acc)
+        if TF32:      # F16 weights, BF16 rows: both exact in TF32
+            acc = tl.dot(q.to(tl.float32), w.to(tl.float32), acc, input_precision="tf32")
+        else:
+            acc = tl.dot(q, w, acc)
     tl.store(QA + (r[:, None] * H + h) * LW + n[None, :], acc.to(tl.bfloat16), mask=r[:, None] < R)
 
 
 @triton.jit
 def _expand_v_tc(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
-                 BN: tl.constexpr, BK: tl.constexpr):
+                 BN: tl.constexpr, BK: tl.constexpr, TF32: tl.constexpr):
     """Program (head, output block, row block): OUT[rows, h, outs] = OL[rows, h, :] @ WV[h, outs, :]^T."""
     h = tl.program_id(0)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -188,7 +191,10 @@ def _expand_v_tc(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.const
         k = k0 + tl.arange(0, BK)
         o = tl.load(OL + (r[:, None] * H + h) * LW + k[None, :], mask=r[:, None] < R, other=0.0)
         w = tl.load(WV + (h * DV + n[None, :]) * LW + k[:, None])
-        acc = tl.dot(o, w, acc)
+        if TF32:
+            acc = tl.dot(o.to(tl.float32), w.to(tl.float32), acc, input_precision="tf32")
+        else:
+            acc = tl.dot(o, w, acc)
     tl.store(OUT + (r[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=r[:, None] < R)
 
 
@@ -200,9 +206,10 @@ def row_block(R: int) -> int:
 def absorb_q(q: torch.Tensor, a, out: torch.Tensor, prompt: bool = False) -> torch.Tensor:
     """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16 (``prompt``: a prompt chunk's rows, any R)."""
     R, H, D = q.shape
-    if prompt and PROMPT_ABSORB and isinstance(a, AbsorbW) and q.is_contiguous() and D % 64 == 0 and a.lw % 64 == 0:
+    if (prompt and PROMPT_ABSORB and getattr(a, "wk", None) is not None and q.is_contiguous() and D % 64 == 0
+            and a.lw % 64 == 0 and a.wk.is_contiguous()):
         _absorb_q_tc[(H, a.lw // 64, triton.cdiv(R, 64))](q, a.wk, out, R, H=H, D=D, LW=a.lw, BM=64, BN=64, BK=64,
-                                                           num_warps=4)
+                                                           TF32=a.wk.dtype != q.dtype, num_warps=4)
         return out
     if isinstance(a, AbsorbQ4):
         rb = row_block(R)
@@ -217,10 +224,10 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor, prompt: bool = False) -> tor
 def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, prompt: bool = False) -> torch.Tensor:
     """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16 (``prompt``: a prompt chunk's rows, any R)."""
     R, H, _ = o_lat.shape
-    if (prompt and PROMPT_ABSORB and isinstance(a, AbsorbW) and o_lat.is_contiguous() and a.lw % 64 == 0
-            and a.v_dim % 64 == 0):
+    if (prompt and PROMPT_ABSORB and getattr(a, "wv", None) is not None and o_lat.is_contiguous() and a.lw % 64 == 0
+            and a.v_dim % 64 == 0 and a.wv.is_contiguous()):
         _expand_v_tc[(H, a.v_dim // 64, triton.cdiv(R, 64))](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw, BM=64,
-                                                              BN=64, BK=64, num_warps=4)
+                                                              BN=64, BK=64, TF32=a.wv.dtype != o_lat.dtype, num_warps=4)
         return out
     if isinstance(a, AbsorbQ4):
         BN = 16
