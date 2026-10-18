@@ -309,6 +309,9 @@ class GlmEngine:
                 from . import disk_points
 
                 self.store = disk_points.open_store(self)
+        self.glock = threading.Lock()                 # a request, or the idle copier below, at a time
+        if self.store is not None:
+            threading.Thread(target=self._idle_saver, daemon=True, name="glm-idle-saver").start()
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -682,8 +685,32 @@ class GlmEngine:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
         return stats
 
+    def _idle_saver(self) -> None:
+        """Never drop: kept states that waited for room in the disk queue are copied while no request runs, as soon
+        as the queue has room (the writer drains it while the engine is idle)."""
+
+        from . import disk_points
+
+        while True:
+            time.sleep(0.5)
+            if self.unsaved and not self.busy and self.glock.acquire(blocking=False):
+                try:
+                    disk_points.retry(self)
+                except Exception as exc:  # noqa: BLE001 - the disk copy never stops the server
+                    print(f"[prompt-cache] idle save failed: {type(exc).__name__}: {exc}", flush=True)
+                finally:
+                    self.glock.release()
+
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
                  constraint=None) -> dict[str, Any]:
+        lock = getattr(self, "glock", None)
+        if lock is None:
+            return self._generate(prompt, max_tokens, sampling, on_tokens, draft, constraint)
+        with lock:
+            return self._generate(prompt, max_tokens, sampling, on_tokens, draft, constraint)
+
+    def _generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
+                  constraint=None) -> dict[str, Any]:
         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
 
         if len(prompt) >= self.limit:
