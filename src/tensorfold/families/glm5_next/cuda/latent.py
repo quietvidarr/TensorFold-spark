@@ -154,14 +154,56 @@ def _expand_v4(OL, WW, WS, WB, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl
         tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
 
 
+# TF_GLM_PROMPT_ABSORB=1 (default): a prompt chunk's absorb/expand per head on the tensor cores (bf16 x bf16 products
+# are exact in FP32, FP32 sums, then the same bf16 rounding), one tile config for every row count: a prompt row's bits
+# depend on that row alone, so a resumed prompt equals a fresh one. Decode windows keep the per-row kernels.
+PROMPT_ABSORB = __import__("os").environ.get("TF_GLM_PROMPT_ABSORB", "1") != "0"
+
+
+@triton.jit
+def _absorb_q_tc(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
+                 BN: tl.constexpr, BK: tl.constexpr):
+    """Program (head, column block, row block): QA[rows, h, cols] = Q[rows, h, :] @ WK[h, :, cols]."""
+    h = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    r = tl.program_id(2) * BM + tl.arange(0, BM)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        q = tl.load(Q + (r[:, None] * H + h) * D + k[None, :], mask=r[:, None] < R, other=0.0)
+        w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :])
+        acc = tl.dot(q, w, acc)
+    tl.store(QA + (r[:, None] * H + h) * LW + n[None, :], acc.to(tl.bfloat16), mask=r[:, None] < R)
+
+
+@triton.jit
+def _expand_v_tc(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
+                 BN: tl.constexpr, BK: tl.constexpr):
+    """Program (head, output block, row block): OUT[rows, h, outs] = OL[rows, h, :] @ WV[h, outs, :]^T."""
+    h = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    r = tl.program_id(2) * BM + tl.arange(0, BM)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, LW, BK):
+        k = k0 + tl.arange(0, BK)
+        o = tl.load(OL + (r[:, None] * H + h) * LW + k[None, :], mask=r[:, None] < R, other=0.0)
+        w = tl.load(WV + (h * DV + n[None, :]) * LW + k[:, None])
+        acc = tl.dot(o, w, acc)
+    tl.store(OUT + (r[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=r[:, None] < R)
+
+
 def row_block(R: int) -> int:
     """Rows per program: 1 for decode windows (most parallel), 16 for prefill chunks (weights reused)."""
     return 1 if R <= 16 else 16
 
 
-def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16."""
+def absorb_q(q: torch.Tensor, a, out: torch.Tensor, prompt: bool = False) -> torch.Tensor:
+    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16 (``prompt``: a prompt chunk's rows, any R)."""
     R, H, D = q.shape
+    if prompt and PROMPT_ABSORB and isinstance(a, AbsorbW) and q.is_contiguous() and D % 64 == 0 and a.lw % 64 == 0:
+        _absorb_q_tc[(H, a.lw // 64, triton.cdiv(R, 64))](q, a.wk, out, R, H=H, D=D, LW=a.lw, BM=64, BN=64, BK=64,
+                                                           num_warps=4)
+        return out
     if isinstance(a, AbsorbQ4):
         rb = row_block(R)
         _absorb_q4[(H, a.lw // 64, triton.cdiv(R, rb))](q, a.wkw, a.wks, a.wkb, out, R, H=H, D=D, LW=a.lw, RB=rb,
@@ -172,9 +214,14 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16."""
+def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, prompt: bool = False) -> torch.Tensor:
+    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16 (``prompt``: a prompt chunk's rows, any R)."""
     R, H, _ = o_lat.shape
+    if (prompt and PROMPT_ABSORB and isinstance(a, AbsorbW) and o_lat.is_contiguous() and a.lw % 64 == 0
+            and a.v_dim % 64 == 0):
+        _expand_v_tc[(H, a.v_dim // 64, triton.cdiv(R, 64))](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw, BM=64,
+                                                              BN=64, BK=64, num_warps=4)
+        return out
     if isinstance(a, AbsorbQ4):
         BN = 16
         _expand_v4[(H, a.v_dim // BN)](o_lat, a.wvw, a.wvs, a.wvb, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN,
