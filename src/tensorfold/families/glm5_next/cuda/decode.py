@@ -455,8 +455,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
         with prof.timed("commit"):
             commit(w, st, b, R, R)
-    for kept in kepts:
-        keep(kept)
+        for kept in kepts:                      # handed over chunk by chunk: a long prompt's many points never
+            keep(kept)                          # pile up in GPU memory (each holds every KDA layer's state)
+        kepts = []
     prof.active = False
     prof.report(len(prompt) - begin)
     if e.constraint is not None:                         # the first token's row, under the reply's grammar
