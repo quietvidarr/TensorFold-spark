@@ -8,3 +8,4 @@ MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
 
 This fork (quietvidarr/TensorFold-spark) modifies and adds files; see CHANGES.md.
+GLM-5.3 Flash patches 01-04 are by sxuff (github.com/sxuff/glm53-flash-single-gb10, MIT).
