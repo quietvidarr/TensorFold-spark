@@ -39,6 +39,7 @@ import torch
 G = 256                  # tokens a step of the prefix hash chain covers (= markers.MIN_GAP, the closest two points get)
 B = 1024                 # rows a cache block holds (a multiple of G and of every attention pooling ratio)
 GIB = 1024**3
+PACE_S = float(os.environ.get("TF_PROMPT_CACHE_PACE_S", "600") or 0)   # the writer waits for an idle engine this long
 RELEASE_PINNED = os.environ.get("TF_PROMPT_CACHE_RELEASE_PINNED", "1") != "0" and hasattr(torch._C, "_host_emptyCache")
 
 
@@ -298,6 +299,18 @@ class Store:
         # the default rollback journal, not WAL: the router reads this file from a read-only mount as another user
         return sqlite3.connect(self.root / "index.sqlite", timeout=60, isolation_level=None)
 
+    def _pace(self, nbytes: int) -> None:
+        """Write while the engine is idle: a big point's save (serialization and file writes in this process) slows a
+        prefill running meanwhile. Never drops: it waits at most PACE_S, and not at all once the queue holds its cap
+        (the engine then needs room), so a point is always written."""
+
+        if self.idle is None or PACE_S <= 0:
+            return
+        t0 = time.monotonic()
+        while (not self.idle() and self.queued <= max(self.queue_cap, nbytes)
+               and time.monotonic() - t0 < PACE_S):   # (a point bigger than the cap: alone in the queue)
+            time.sleep(0.05)
+
     def _lengths(self) -> None:
         self.lengths = sorted({n for n, _ in self.points.values()}, reverse=True)
 
@@ -311,6 +324,7 @@ class Store:
                 op = None
             try:
                 if op is not None and op[0] == "put":
+                    self._pace(op[7])
                     try:
                         if op[-1] is not None:
                             op[-1].synchronize()              # the host copies have landed (``Copier``)
