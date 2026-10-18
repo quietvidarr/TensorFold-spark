@@ -12,6 +12,7 @@ import triton.language as tl
 HC_BLOCKS = 16
 import os as _os
 HC_FUSE = _os.environ.get("TF_GLM_HC_FUSE", "1") != "0"     # hc_post + the next hc_pre in one pass (same bits)
+HC_FUSE_ROWS = 64                                          # fewer rows (decode): the two kernels' wider grids win
 HC_PP_WARPS = 4                                            # _hc_partial's warps: the tile reductions' order
 
 
@@ -342,7 +343,7 @@ def hc_post_pre(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor, base:
 
     world, rows, d = gathered.shape
     wide = x.shape[1]
-    if (world != 1 or x.dtype != torch.float32 or wide != 4 * d or HC_BLOCKS != 16 or (d // 4) % 128 or not HC_FUSE
+    if (world != 1 or x.dtype != torch.float32 or wide != 4 * d or HC_BLOCKS != 16 or (d // 4) % 128 or not HC_FUSE or rows < HC_FUSE_ROWS
             or not all(t.is_contiguous() for t in (x, gathered, post, comb)) or gathered.dtype != torch.float32):
         hc_post(x, x, gathered, post, comb, fp32_residual=x.dtype == torch.float32)
         hc_pre(x, fn, base, scale, norm_w, out, xs, post, comb, part, eps, hc_eps, iters)
