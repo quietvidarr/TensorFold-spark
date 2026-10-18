@@ -1,6 +1,6 @@
 """Reuse expert weights in wider idle prompt pieces only when the admitted window leaves enough room."""
 
-from tensorfold.cuda.geometry import PREFILL_ROWS, indexed_prompt_bytes
+from tensorfold.cuda.geometry import _PREFILL_ROWS as PREFILL_ROWS, indexed_prompt_bytes  # Flash Next's 2048, not GLM's
 
 IDLE_ROWS = 4096
 

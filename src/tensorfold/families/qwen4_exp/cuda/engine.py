@@ -87,7 +87,7 @@ class FlashNextEngine:
         from .kvcache import BITS_OF, check as check_kv
         from .weights import draft_token_ids, load
         from tensorfold.cuda.capacity import admit, config, gather_ints
-        from tensorfold.cuda.geometry import (PREFILL_ROWS, gdn_geometry, indexed_prefill_rows,
+        from tensorfold.cuda.geometry import (_PREFILL_ROWS as PREFILL_ROWS, gdn_geometry, indexed_prefill_rows,
                                               indexed_stream_geometry, indexed_weights)
 
         # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan)
