@@ -493,12 +493,16 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None) -> None:
+                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None,
+                  nxt: LayerW | None = None, pre_done: bool = False) -> bool:
+    """One layer; with ``nxt`` its last hc_post and nxt's first hc_pre run fused (True: nxt's pre is done)."""
+
     c = w.cfg
     x = b.x[:R]
     h = layer.attn_hc
-    glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+    if not pre_done:
+        glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
     if layer.kind == "kda":
         with prof.timed("kda"):
             g = kda_block(layer, w, st, b, R, cut)
@@ -508,13 +512,23 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
             g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
                           st.index[di] if st.index is not None else None, host_pos, sparse_np)
     with prof.timed("hc"):
-        glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
         h = layer.ffn_hc
-        glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+        if b.fp32_residual:
+            glue.hc_post_pre(x, g, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R],
+                             b.comb[:R], b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+        else:
+            glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
+            glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                        b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+    if nxt is not None and b.fp32_residual:
+        h = nxt.attn_hc
+        glue.hc_post_pre(x, g, h.fn, h.base, h.scale, nxt.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                         b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+        return True
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
+    return False
 
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
@@ -549,8 +563,10 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
         raise ValueError("a prompt cut must lie inside a prefill chunk")
     c = w.cfg
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
-    for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
+    done = False
+    for i, layer in enumerate(w.layers):
+        nxt = w.layers[i + 1] if i + 1 < len(w.layers) else None
+        done = layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut, nxt=nxt, pre_done=done)
         for slot in b.tap_at.get(layer.index, ()):
             glue.stream_mean(b.x[:R], b.taps[slot][:R])
     glue.stream_mean(b.x[:R], b.hidden[:R])

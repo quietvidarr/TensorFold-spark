@@ -10,6 +10,9 @@ import triton.language as tl
 
 # fixed K split of the mixing dots (a function of the shape only; changing it changes bits for every row alike)
 HC_BLOCKS = 16
+import os as _os
+HC_FUSE = _os.environ.get("TF_GLM_HC_FUSE", "1") != "0"     # hc_post + the next hc_pre in one pass (same bits)
+HC_PP_WARPS = 4                                            # _hc_partial's warps: the tile reductions' order
 
 
 # -- embedding ----------------------------------------------------------------------------------------------
@@ -224,6 +227,129 @@ def _hc_post_fp32(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, 
         v = tl.fma(c2, x2, v)
         v = tl.fma(c3, x3, v)
         tl.store(XOUT + r * (S * D) + s * D + d, v)
+
+
+@triton.jit
+def _pp_row(X, G, COMB, r, d, s: tl.constexpr, ps, branch, x0, x1, x2, x3, D: tl.constexpr):
+    c0 = tl.load(COMB + r * 16 + 0 * 4 + s)
+    c1 = tl.load(COMB + r * 16 + 1 * 4 + s)
+    c2 = tl.load(COMB + r * 16 + 2 * 4 + s)
+    c3 = tl.load(COMB + r * 16 + 3 * 4 + s)
+    v = ps * branch
+    v = tl.fma(c0, x0, v)
+    v = tl.fma(c1, x1, v)
+    v = tl.fma(c2, x2, v)
+    v = tl.fma(c3, x3, v)
+    tl.store(X + r * (4 * D) + s * D + d, v)
+    return v
+
+
+@triton.jit
+def _hc_post_part(X, G, POST, COMB, FN, PART, ROWS, D: tl.constexpr, NB: tl.constexpr, SUB: tl.constexpr):
+    """_hc_post_fp32 then _hc_partial in one pass (FP32 streams, four of them, NB = 16): program (j, p) updates rows
+    2p and 2p + 1's streams at d in [j D / 4, (j + 1) D / 4) in place and accumulates their four mixing-dot blocks
+    there (blocks s * 4 + j), with _hc_partial's tile shapes and step order (the same bits as the two kernels); each
+    FN tile is loaded once for both rows."""
+
+    j = tl.program_id(0)
+    ra = tl.program_id(1).to(tl.int64) * 2
+    rb = tl.minimum(ra + 1, ROWS - 1)        # an odd last row: computed twice, the same values
+    QB: tl.constexpr = D // 4
+    WIDE: tl.constexpr = 4 * D
+    m = tl.arange(0, 32)
+    k = tl.arange(0, SUB)
+    pa0 = tl.load(POST + ra * 4 + 0)
+    pa1 = tl.load(POST + ra * 4 + 1)
+    pa2 = tl.load(POST + ra * 4 + 2)
+    pa3 = tl.load(POST + ra * 4 + 3)
+    pb0 = tl.load(POST + rb * 4 + 0)
+    pb1 = tl.load(POST + rb * 4 + 1)
+    pb2 = tl.load(POST + rb * 4 + 2)
+    pb3 = tl.load(POST + rb * 4 + 3)
+    a0 = tl.zeros((32,), dtype=tl.float32)
+    a1 = tl.zeros((32,), dtype=tl.float32)
+    a2 = tl.zeros((32,), dtype=tl.float32)
+    a3 = tl.zeros((32,), dtype=tl.float32)
+    b0 = tl.zeros((32,), dtype=tl.float32)
+    b1 = tl.zeros((32,), dtype=tl.float32)
+    b2 = tl.zeros((32,), dtype=tl.float32)
+    b3 = tl.zeros((32,), dtype=tl.float32)
+    qa0 = tl.zeros((SUB,), dtype=tl.float32)
+    qa1 = tl.zeros((SUB,), dtype=tl.float32)
+    qa2 = tl.zeros((SUB,), dtype=tl.float32)
+    qa3 = tl.zeros((SUB,), dtype=tl.float32)
+    qb0 = tl.zeros((SUB,), dtype=tl.float32)
+    qb1 = tl.zeros((SUB,), dtype=tl.float32)
+    qb2 = tl.zeros((SUB,), dtype=tl.float32)
+    qb3 = tl.zeros((SUB,), dtype=tl.float32)
+    for t in range(QB // SUB):
+        d = j * QB + t * SUB + k
+        ga = tl.load(G + ra * D + d).to(tl.float32)
+        xa0 = tl.load(X + ra * WIDE + d).to(tl.float32)
+        xa1 = tl.load(X + ra * WIDE + D + d).to(tl.float32)
+        xa2 = tl.load(X + ra * WIDE + 2 * D + d).to(tl.float32)
+        xa3 = tl.load(X + ra * WIDE + 3 * D + d).to(tl.float32)
+        gb = tl.load(G + rb * D + d).to(tl.float32)
+        xb0 = tl.load(X + rb * WIDE + d).to(tl.float32)
+        xb1 = tl.load(X + rb * WIDE + D + d).to(tl.float32)
+        xb2 = tl.load(X + rb * WIDE + 2 * D + d).to(tl.float32)
+        xb3 = tl.load(X + rb * WIDE + 3 * D + d).to(tl.float32)
+        for s in tl.static_range(4):
+            psa = pa0 if s == 0 else (pa1 if s == 1 else (pa2 if s == 2 else pa3))
+            psb = pb0 if s == 0 else (pb1 if s == 1 else (pb2 if s == 2 else pb3))
+            va = _pp_row(X, G, COMB, ra, d, s, psa, ga, xa0, xa1, xa2, xa3, D)
+            vb = _pp_row(X, G, COMB, rb, d, s, psb, gb, xb0, xb1, xb2, xb3, D)
+            w = tl.load(FN + m[:, None] * WIDE + s * D + d[None, :], mask=m[:, None] < 24, other=0.0).to(tl.float32)
+            if s == 0:
+                a0 += tl.sum(w * va[None, :], axis=1)
+                qa0 += va * va
+                b0 += tl.sum(w * vb[None, :], axis=1)
+                qb0 += vb * vb
+            elif s == 1:
+                a1 += tl.sum(w * va[None, :], axis=1)
+                qa1 += va * va
+                b1 += tl.sum(w * vb[None, :], axis=1)
+                qb1 += vb * vb
+            elif s == 2:
+                a2 += tl.sum(w * va[None, :], axis=1)
+                qa2 += va * va
+                b2 += tl.sum(w * vb[None, :], axis=1)
+                qb2 += vb * vb
+            else:
+                a3 += tl.sum(w * va[None, :], axis=1)
+                qa3 += va * va
+                b3 += tl.sum(w * vb[None, :], axis=1)
+                qb3 += vb * vb
+    for i in tl.static_range(2):
+        r = ra if i == 0 else rb
+        for s in tl.static_range(4):
+            o = (r * NB + s * 4 + j) * 32
+            if i == 0:
+                acc = a0 if s == 0 else (a1 if s == 1 else (a2 if s == 2 else a3))
+                q = qa0 if s == 0 else (qa1 if s == 1 else (qa2 if s == 2 else qa3))
+            else:
+                acc = b0 if s == 0 else (b1 if s == 1 else (b2 if s == 2 else b3))
+                q = qb0 if s == 0 else (qb1 if s == 1 else (qb2 if s == 2 else qb3))
+            tl.store(PART + o + m, acc, mask=m < 24)
+            tl.store(PART + o + 24, tl.sum(q, axis=0))
+
+
+def hc_post_pre(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor,
+                norm_w: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+                part: torch.Tensor, eps: float, hc_eps: float, iters: int) -> None:
+    """hc_post(x, x, gathered, post, comb, fp32_residual=True) then hc_pre(x, fn, ...) with the post and the mixing
+    dots in one pass over the streams (the same bits); falls back to the two calls where the fused shape does not apply."""
+
+    world, rows, d = gathered.shape
+    wide = x.shape[1]
+    if (world != 1 or x.dtype != torch.float32 or wide != 4 * d or HC_BLOCKS != 16 or (d // 4) % 128 or not HC_FUSE
+            or not all(t.is_contiguous() for t in (x, gathered, post, comb)) or gathered.dtype != torch.float32):
+        hc_post(x, x, gathered, post, comb, fp32_residual=x.dtype == torch.float32)
+        hc_pre(x, fn, base, scale, norm_w, out, xs, post, comb, part, eps, hc_eps, iters)
+        return
+    _hc_post_part[(4, (rows + 1) // 2)](x, gathered, post, comb, fn, part, rows, D=d, NB=HC_BLOCKS, SUB=128, num_warps=HC_PP_WARPS)
+    _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=4, NB=HC_BLOCKS,
+                        ITERS=iters, BLOCK=d, num_warps=8)
 
 
 def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
