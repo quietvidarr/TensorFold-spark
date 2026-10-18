@@ -68,6 +68,13 @@ class ProjectionScratch:
             raise ValueError('scratch rows must be positive')
         mats = [p for q in projections for p in leaves(q)]
         self.rows, self.chunk = rows, min(rows, 128)
+        # a prompt chunk's EXL3 projections in one prompt GEMM (cuda/exl3/prefill.py: W_q decoded once, fixed tiles,
+        # so a row's bits never depend on its window): our prefill path; TF_GLM_PROMPT_LINEAR=0 keeps 128-row windows
+        import os
+        self.ws = None
+        if prefill and os.environ.get("TF_GLM_PROMPT_LINEAR", "1").strip() != "0" and str(device).startswith("cuda"):
+            from tensorfold.cuda.exl3.prefill import Workspace
+            self.ws = Workspace()
         self.k = max((q.k for q in mats), default=1)
         self.n = max((q.n for q in mats), default=1)
         self.xh = torch.empty(self.chunk*self.k,dtype=torch.float16,device=device)
@@ -85,6 +92,9 @@ class ProjectionScratch:
     def nbytes(self):
         return sum(t.numel()*t.element_size() for t in
                    [self.xh,self.z,*self.inputs.values(),*self.outputs.values()])
+
+
+PROMPT_GEMM_MAX_N = 32768        # wider (the vocabulary head): its decoded W would not pay for a prompt's last rows
 
 
 def _plain_cuda(q,x,out):
@@ -106,6 +116,11 @@ def matmul(q, x, out, scratch):
         return out
     if q.k>scratch.k or q.n>scratch.n:
         raise ValueError('projection exceeds preallocated scratch dimensions')
+    if (getattr(scratch, "ws", None) is not None and isinstance(q, Exl3Linear) and x.is_cuda
+            and q.n % 128 == 0 and q.k % 32 == 0 and q.n <= PROMPT_GEMM_MAX_N):
+        from tensorfold.cuda.exl3.prefill import matmul as prompt_matmul
+        prompt_matmul(q, x, dst, scratch.ws)
+        return out
     for start in range(0,m,scratch.chunk):
         r=min(scratch.chunk,m-start)
         xi=scratch.inputs[x.dtype][:r*q.k].view(r,q.k)
