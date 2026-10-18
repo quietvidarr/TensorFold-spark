@@ -39,6 +39,7 @@ import torch
 G = 256                  # tokens a step of the prefix hash chain covers (= markers.MIN_GAP, the closest two points get)
 B = 1024                 # rows a cache block holds (a multiple of G and of every attention pooling ratio)
 GIB = 1024**3
+RELEASE_PINNED = os.environ.get("TF_PROMPT_CACHE_RELEASE_PINNED", "1") != "0" and hasattr(torch._C, "_host_emptyCache")
 
 
 def _env(name: str, default, cast=float):
@@ -315,6 +316,9 @@ class Store:
                             op[-1].synchronize()              # the host copies have landed (``Copier``)
                         self._write(db, *op[1:-1])
                         self._journal(f"w {op[1]}")
+                        if self.queued <= 0 and RELEASE_PINNED:   # drained: the pinned copies' memory back to the
+                            op = ("put",)                         # system (torch keeps freed pinned blocks cached;
+                            torch._C._host_emptyCache()           # on unified memory that is GPU memory too)
                     except Exception as exc:  # noqa: BLE001
                         self.stats["lost"] += 1
                         self._journal(f"x {op[1]}")
