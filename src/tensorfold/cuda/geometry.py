@@ -7,7 +7,11 @@ import re
 
 from .capacity import Geometry, Weights, headers, itemsize
 
-PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
+_PREFILL_ROWS = 2048    # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
+# TF_GLM_PREFILL_ROWS (lab sweep): a GLM prompt chunk's rows (admission sizes the buffers by it), 512 to 16,384
+PREFILL_ROWS = int(__import__("os").environ.get("TF_GLM_PREFILL_ROWS", "") or _PREFILL_ROWS)
+if not 512 <= PREFILL_ROWS <= 16384:
+    raise ValueError(f"TF_GLM_PREFILL_ROWS: 512 to 16,384, not {PREFILL_ROWS}")
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
