@@ -73,7 +73,7 @@ def rot128(v, R: tl.constexpr):
 def tiles(k: int, n: int) -> tuple[int, int, int, int, int]:
     """(rows a program, K step, warps, stages, row blocks a raster group): the shape's alone, so a row never depends on its chunk."""
 
-    return 128, 32, 8, 4, 8
+    return 128, 64, 8, 4, 8
 
 
 class Workspace:
