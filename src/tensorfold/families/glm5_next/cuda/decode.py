@@ -77,6 +77,7 @@ def _probability(values: np.ndarray, tokens: np.ndarray, chosen: list[int], samp
 
 
 PREFILL_ROWS = 2048      # rows of a prompt chunk
+CUTS_PER_CHUNK = max(1, int(__import__("os").environ.get("TF_GLM_CUTS_PER_CHUNK", "3")))   # in-pass points a chunk keeps
 
 
 class Engine:
@@ -419,6 +420,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         R = len(chunk)
         here = [q - start for q in wanted if 0 < q - start <= R]
         inner = [q for q in here if q < R]
+        if len(inner) > CUTS_PER_CHUNK:                 # each cut holds every KDA layer's state (~141 MB) until it
+            inner = inner[-CUTS_PER_CHUNK:]             # is kept: a chunk keeps its last few (memory reserve)
+            here = [q for q in here if q in inner or q == R]
         if len(inner) == 1:                              # upstream's single cut, unchanged
             cut = Cut(inner[0], torch.empty_like(st.rec[0]), st.conv.clone())
         elif inner:
