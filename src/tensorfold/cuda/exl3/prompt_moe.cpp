@@ -49,7 +49,7 @@ void gate_up(const at::Tensor& xh, const at::Tensor& tp0, const at::Tensor& tp1,
     check(work, at::kInt, "work"); check(xd, at::kHalf, "xd");
     TORCH_CHECK(D % 128 == 0 && I % 128 == 0, "gate_up: D and I must split in 128");
     TORCH_CHECK(xd.numel() >= items * 128 * I, "xd too small: [work items, I / 16, 128, 16]");
-    TORCH_CHECK(k2max == 8 || k2max == 12 || k2max == 16, "k2max 8, 12 or 16");
+    TORCH_CHECK(k2max == 4 || k2max == 6 || k2max == 8 || k2max == 12 || k2max == 16, "k2max 4, 6, 8, 12 or 16");
     if (nrm) { check(*nrm, at::kFloat, "nrm"); TORCH_CHECK(nrm->numel() >= P * (I / 128), "nrm too small: [P, I / 128]"); }
     c10::cuda::CUDAGuard guard(xh.device());
     if (items > 0)
@@ -68,7 +68,7 @@ void down(const at::Tensor& xd, const at::Tensor& tp, const at::Tensor& k2, cons
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kFloat && out.stride(-1) == 1 && out.stride(0) == D,
                 "out: fp32 rows of D");
     TORCH_CHECK(D % 128 == 0 && I % 16 == 0, "down: D must split in 128, I in 16");
-    TORCH_CHECK(k2max == 8 || k2max == 12 || k2max == 16, "k2max 8, 12 or 16");
+    TORCH_CHECK(k2max == 4 || k2max == 6 || k2max == 8 || k2max == 12 || k2max == 16, "k2max 4, 6, 8, 12 or 16");
     if (wts) TORCH_CHECK(wts->is_cuda() && wts->scalar_type() == at::kFloat && wts->is_contiguous(), "wts: fp32");
     if (grid) { TORCH_CHECK(wts, "grid needs wts"); check(*grid, at::kFloat, "grid"); TORCH_CHECK(grid->numel() >= rows, "grid: [R]"); }
     c10::cuda::CUDAGuard guard(xd.device());
