@@ -146,6 +146,12 @@ def _weight_transform(rule, world: int, layers: int, load_mtp: bool):
 class GlmEngine:
     """GLM on one local GPU or two NCCL ranks, with explicit startup/work contracts."""
 
+    points = store = None                 # our prompt cache (set in __init__): message-start points, the disk store
+    unsaved: list = []                    # kept snapshots waiting for room in the disk queue (never dropped)
+    later: list = []                      # this prefill's kept snapshots, copied to disk after the first token
+    conts: dict = {}                      # keep_rank: the continuations requests resumed each point with
+    busy = False
+
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, world: int = 2,
                  policy: str = DEFAULT_POLICY, drafter: Path | None = None, context: int | None = None,
                  context_explicit: bool | None = None, serial_only: bool = False, comm=None,
@@ -290,6 +296,18 @@ class GlmEngine:
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = 0 if self.target_only else int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+        # our prompt cache (one GPU): states at message starts (TF_POINTS_LAST, markers.py) kept inside the prefill
+        # pass, dropped by keep_rank, and copied to the store on disk (TF_PROMPT_CACHE_DIR; disk_points.py)
+        self.points, self.store, self.unsaved, self.conts, self.later, self.busy = None, None, [], {}, [], False
+        if world == 1 and self.cache_entries > 0:
+            if os.environ.get("TF_POINTS_LAST", "0").strip() not in ("", "0"):
+                from tensorfold.cuda import markers
+
+                self.points = markers.resume_points(model_dir)
+            if os.environ.get("TF_PROMPT_CACHE_DIR", ""):
+                from . import disk_points
+
+                self.store = disk_points.open_store(self)
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -471,12 +489,31 @@ class GlmEngine:
         self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
         dropped = False
         while len(self.cache) > 1 and (len(self.cache) > self.cache_entries or self._held_bytes() > self.cache_bytes):
-            self._drop(self.cache[0])
+            gone = self.cache[self._victim()]
+            if self.store is not None and any(x is gone for x in self.later):
+                from . import disk_points          # a point of this prefill not copied yet: copied before it goes
+
+                self.later = [x for x in self.later if x is not gone]
+                disk_points.save(self, gone)
+            self._drop(gone)
             dropped = True
         if dropped:
             import torch
 
             torch.cuda.empty_cache()
+
+    def _victim(self, among=None) -> int:
+        """The kept snapshot to drop first: upstream the oldest; with our points ``keep_rank``'s order (a point inside
+        a conversation's history, then a conversation's newest, then shared starts; one not on disk yet last)."""
+
+        if self.points is None and self.store is None:
+            return 0 if among is None else among[0]
+        from tensorfold.cuda import keep_rank
+
+        ids = [c.ids for c in self.cache]
+        return keep_rank.victim(ids, [len(self.conts.get(keep_rank.point_key(i), ())) for i in ids],
+                                [any(u is c for u in self.unsaved) or any(u is c for u in self.later)
+                                 for c in self.cache], among)
 
     def _take_over(self, keep: list[int]) -> None:
         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
@@ -487,6 +524,22 @@ class GlmEngine:
 
         def resumes(c) -> bool:
             return len(c.ids) <= len(keep) and keep[:len(c.ids)] == c.ids
+
+        if self.store is not None:
+            from tensorfold.cuda import keep_rank
+
+            from . import disk_points
+
+            going = [c for c in self.cache if c.rows is None and not resumes(c) and live[:len(c.ids)] == c.ids]
+            if self.unsaved:                     # never dropped: their rows are overwritten next, so copied now
+                disk_points.retry(self, only=going)
+            ids = [c.ids for c in self.cache]
+            ranks = keep_rank.ranks(ids, [len(self.conts.get(keep_rank.point_key(i), ())) for i in ids],
+                                    [False] * len(ids))
+            for c, r in zip(list(self.cache), ranks):
+                if r == 0 and any(c is g for g in going):  # inside a newer kept point's history: on disk already
+                    self._drop(c)
+                    dropped = True
 
         for snap in list(self.cache):
             n = len(snap.ids)
@@ -511,6 +564,23 @@ class GlmEngine:
             import torch
 
             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+
+    def _keep(self, snap) -> None:
+        self._remember(snap)
+        if self.store is not None and any(c is snap for c in self.cache):
+            self.later.append(snap)
+
+    def _flush(self) -> None:
+        later, self.later = self.later, []
+        if self.store is None:
+            return
+        from . import disk_points
+
+        if self.unsaved:
+            disk_points.retry(self)
+        for snap in later:
+            if any(c is snap for c in self.cache):
+                disk_points.save(self, snap)
 
     def _held_bytes(self) -> int:
         from .decode import snapshot_bytes
@@ -543,12 +613,19 @@ class GlmEngine:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft and self.cache_entries > 0 and self.cache_bytes > 0
-                        else None, keep=self._remember)
+        keeping = draft and self.cache_entries > 0 and self.cache_bytes > 0
+        keep_at = max(1, len(prompt) - 1) if keeping else None
+        if keeping and self.points is not None:      # message starts too, inside the same passes
+            from tensorfold.cuda.markers import MIN_GAP
+
+            starts = [p for p in self.points(prompt) if p >= cut + MIN_GAP and p < keep_at]
+            keep_at = starts + [keep_at] if starts else keep_at
+        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, keep_at=keep_at,
+                        keep=self._keep)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
+        self._flush()                            # the points' disk copies after the first token, not before it
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
         policy = decode_policy(code)
@@ -601,6 +678,19 @@ class GlmEngine:
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         draft = bool(draft and not self.target_only)
         hit = self._resume(list(prompt), code) if draft and self.cache_entries > 0 and self.cache_bytes > 0 else None
+        if draft and self.store is not None and self.cache_entries > 0 and self.cache_bytes > 0:
+            from . import disk_points
+
+            loaded = disk_points.restore(self, list(prompt), len(hit.ids) if hit is not None else 0)
+            if loaded is not None and (not self._drafters(code)[1] or loaded.mtp_len >= 0):
+                self.cache.append(loaded)                 # a saved snapshot: _take_over leaves it, _run_once loads it
+                hit = self._resume(list(prompt), code)
+        if hit is not None and (self.store is not None or self.points is not None):
+            from tensorfold.cuda import keep_rank
+
+            keep_rank.note(self.conts, list(prompt), len(hit.ids), [c.ids for c in self.cache])
+            if self.store is not None:
+                self.store.used(self.store.prefix(list(prompt)), len(hit.ids))
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -614,7 +704,16 @@ class GlmEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
             self._share(pack(constraint))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
+        self.busy = True
+        try:
+            stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
+        finally:
+            self.busy = False
+            self.later = []
+        if self.unsaved:                               # the disk queue drained while the reply decoded
+            from . import disk_points
+
+            disk_points.retry(self)
         stats.update(policy=spec, drafts=draft)
         return stats
 

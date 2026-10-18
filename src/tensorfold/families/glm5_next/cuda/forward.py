@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Sequence
 from types import SimpleNamespace
@@ -24,11 +25,43 @@ from .weights import LayerW, Weights
 
 @dataclass
 class Cut:
-    """The recurrent state and convolution windows at an interior prompt row."""
+    """The recurrent states and convolution windows at interior prompt rows ``points`` (ascending, 0 < p < R): the
+    KDA chain runs in segments between them inside the one pass (every other layer is row-wise); ``rec[i]`` and
+    ``conv[i]`` receive the state at ``points[i]``. A single int point is one cut (upstream)."""
 
-    point: int
-    rec: torch.Tensor
-    conv: torch.Tensor
+    point: int | list
+    rec: torch.Tensor | list
+    conv: torch.Tensor | list
+
+    def parts(self) -> tuple[list, list, list]:
+        if isinstance(self.point, int):
+            return [self.point], [self.rec], [self.conv]
+        return list(self.point), list(self.rec), list(self.conv)
+
+
+PROMPT_MOE = os.environ.get("TF_GLM_PROMPT_MOE", "1").strip() != "0"   # 0: prompt chunks in 128-row decode windows
+
+
+def prompt_scratch(w: Weights, rows: int, slots: int, dev) -> generic_exl3.Scratch | None:
+    """A prompt chunk's routed-expert scratch for the prompt kernel (v2: every layer's widths 2/3/4/6/8 bits), or None
+    when it is off or a layer does not fit. Only what the v2 kernel reads is full size (xg, y, the grouping)."""
+
+    if not PROMPT_MOE:
+        return None
+    layers = [l.moe.experts for l in w.layers if l.moe is not None and l.moe.experts is not None]
+    if w.mtp is not None and getattr(getattr(w.mtp.layer, "moe", None), "experts", None) is not None:
+        layers.append(w.mtp.layer.moe.experts)
+    if not layers or not all(generic_exl3.prompt_kernel_fits(ex) and generic_exl3.prompt2_fits(ex) for ex in layers):
+        return None
+    s = generic_exl3.Scratch(layers[0], 1, slots, device=dev)      # small z/xu/xd: the v2 kernel never reads them
+    P = rows * slots
+    s.xg = torch.zeros((P, layers[0].dims), dtype=torch.float16, device=dev)
+    s.y = torch.zeros((P, layers[0].dims), dtype=torch.float32, device=dev)
+    maxu = min(P, layers[0].count)
+    s.ids = torch.zeros((maxu,), dtype=torch.int32, device=dev)
+    s.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=dev)
+    s.rows = rows
+    return s
 
 
 class Buffers:
@@ -113,6 +146,10 @@ class Buffers:
                           w.mtp.layer.moe.experts if w.mtp is not None else None)
                 self.exl3 = generic_exl3.Scratch(ex, min(rows, 128), slots, device=dev) if ex is not None else None
                 self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
+                # a prompt chunk's routed experts in one prompt-kernel window (``prompt_moe``): its y is ey
+                self.exl3p = prompt_scratch(w, rows, slots, dev) if prefill else None
+                if self.exl3p is not None:
+                    self.ey = self.exl3p.y[:rows * slots].view(rows, slots, D)
             else:
                 shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
                 self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
@@ -290,13 +327,18 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
                             st.rec[1 - cur, li])
     else:
-        n = cut.point
-        first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
-        _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
-        rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
-        out = torch.cat((first, rest))
+        points, recs, convs = cut.parts()
+        outs, prev, s_in, c_in = [], 0, st.rec[cur, li], st.conv[li]
+        for n, rec, conv in zip(points, recs, convs):
+            outs.append(kda_mod.chain(p[prev:n], k.b_off, b.ka[prev:n], b.kg[prev:n], c_in, k.conv, s_in, k.a_log,
+                                      k.dt_bias, k.norm, c.eps, c.lower, n - prev, b.kscratch, rec[li]).clone())
+            if conv[li].data_ptr() != c_in.data_ptr():
+                conv[li].copy_(c_in)
+            _shift_conv(conv[li:li + 1], b.kproj[:, prev:n], n - prev)
+            prev, s_in, c_in = n, rec[li], conv[li]
+        outs.append(kda_mod.chain(p[prev:], k.b_off, b.ka[prev:R], b.kg[prev:R], c_in, k.conv, s_in, k.a_log,
+                                  k.dt_bias, k.norm, c.eps, c.lower, R - prev, b.kscratch, st.rec[1 - cur, li]))
+        out = torch.cat(outs)
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         st.cur[li] = 1 - cur
         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
@@ -424,7 +466,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
             grouped.route(b.pick[:R], b.plan)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-        if w.meta.get("packed_exl3"):
+        if getattr(b, "exl3p", None) is not None:
+            # a prompt chunk: every row through the prompt kernel, whatever R (a row's bits are its own, so a resumed
+            # prompt's rows equal a fresh prefill's); y lands in ey
+            generic_exl3.routed(b.normed[:R], b.pick[:R], None, m.experts, b.exl3p, None, R, c.limit,
+                                act_mode=generic_exl3.ACT_BF16, prompt=True)
+        elif w.meta.get("packed_exl3"):
             routed_micro_windows(b.normed[:R], b.pick[:R], m.experts, b.exl3, b.ey[:R], R, c.limit)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
@@ -497,7 +544,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
             host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None):
     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
 
-    if cut is not None and (not b.prefill or not 0 < cut.point < R):
+    if cut is not None and (not b.prefill or not all(0 < q < R for q in cut.parts()[0])
+                            or cut.parts()[0] != sorted(set(cut.parts()[0]))):
         raise ValueError("a prompt cut must lie inside a prefill chunk")
     c = w.cfg
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
