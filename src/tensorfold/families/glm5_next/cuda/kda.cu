@@ -268,6 +268,47 @@ __global__ void __launch_bounds__(512) prep_kernel(
     }
 }
 
+
+// Four warp sums at once with warp_sum's tree (stage 16, 8, 4, 2, 1; own + other at each), 6 shuffles instead of 20:
+// lane l ends with the total of value (l >> 3) & 3 (the same bits as warp_sum's).
+__device__ __forceinline__ float scatter_sum4(const float (&x)[4], int lane) {
+    const bool h4 = lane & 16, h3 = lane & 8;
+    float a0 = h4 ? x[2] : x[0], a1 = h4 ? x[3] : x[1];
+    const float s0 = h4 ? x[0] : x[2], s1 = h4 ? x[1] : x[3];
+    a0 = a0 + __shfl_xor_sync(0xffffffffu, s0, 16);
+    a1 = a1 + __shfl_xor_sync(0xffffffffu, s1, 16);
+    float k = h3 ? a1 : a0;
+    const float sd = h3 ? a0 : a1;
+    k = k + __shfl_xor_sync(0xffffffffu, sd, 8);
+    k = k + __shfl_xor_sync(0xffffffffu, k, 4);
+    k = k + __shfl_xor_sync(0xffffffffu, k, 2);
+    k = k + __shfl_xor_sync(0xffffffffu, k, 1);
+    return k;
+}
+
+// update() with its four warp sums through scatter_sum4 (the same bits)
+__device__ __forceinline__ void update4(float (&s)[4][4], const float (&kk)[4], const float (&gg)[4],
+                                        const float* vrow, float beta, int lane) {
+    float kv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        kv[j] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            s[j][i] = s[j][i] * gg[i];
+            kv[j] = kv[j] + s[j][i] * kk[i];
+        }
+    }
+    const float t = scatter_sum4(kv, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float kvj = __shfl_sync(0xffffffffu, t, j << 3);
+        const float delta = (vrow[j] - kvj) * beta;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[j][i] = s[j][i] + kk[i] * delta;
+    }
+}
+
 // Block (head, part): each warp owns 4 value rows; TR rows of saved k, q, decay, v and beta are staged in shared memory at a time.
 template <int WARPS, int TR>
 __global__ void __launch_bounds__(WARPS * 32) step_kernel(
@@ -288,9 +329,54 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
     for (int j = 0; j < 4; ++j)
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
+#ifndef KDA_STEP_NOPREFETCH
+#define KDA_STEP_PREFETCH
+#endif
+#ifdef KDA_STEP_PREFETCH
+    // the next TR rows' inputs are loaded into registers while this TR rows' steps run (one smem buffer)
+    constexpr int PK = (TR * DK + NT - 1) / NT, PV = (TR * VR + NT - 1) / NT;
+    float rk[PK], rq[PK], rg[PK], rv[PV], rb = 0.f;
+    auto fetch = [&](int r0) {
+        const int n = rows - r0 < TR ? rows - r0 : TR;
+#pragma unroll
+        for (int u = 0; u < PK; ++u) {
+            const int x = threadIdx.x + u * NT, rr = x / DK, c = x % DK;
+            if (x < n * DK) {
+                const size_t base = ((size_t)(r0 + rr) * H + h) * DK + c;
+                rk[u] = k_save[base]; rq[u] = q_in[base]; rg[u] = g_save[base];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < PV; ++u) {
+            const int x = threadIdx.x + u * NT, rr = x / VR, c = x % VR;
+            if (x < n * VR) rv[u] = __bfloat162float(v_save[((size_t)(r0 + rr) * H + h) * DV + v0 + c]);
+        }
+        if ((int)threadIdx.x < n) rb = b_save[(r0 + threadIdx.x) * H + h];
+    };
+    auto put = [&](int r0) {
+        const int n = rows - r0 < TR ? rows - r0 : TR;
+#pragma unroll
+        for (int u = 0; u < PK; ++u) {
+            const int x = threadIdx.x + u * NT, rr = x / DK, c = x % DK;
+            if (x < n * DK) { kt[rr][c] = rk[u]; qt[rr][c] = rq[u]; gt[rr][c] = rg[u]; }
+        }
+#pragma unroll
+        for (int u = 0; u < PV; ++u) {
+            const int x = threadIdx.x + u * NT, rr = x / VR, c = x % VR;
+            if (x < n * VR) vt[rr][c] = rv[u];
+        }
+        if ((int)threadIdx.x < n) bt[threadIdx.x] = rb;
+    };
+    if (rows > 0) fetch(0);
+#endif
     for (int r0 = 0; r0 < rows; r0 += TR) {
         const int n = rows - r0 < TR ? rows - r0 : TR;
         __syncthreads();
+#ifdef KDA_STEP_PREFETCH
+        put(r0);
+        __syncthreads();
+        if (r0 + TR < rows) fetch(r0 + TR);
+#else
         for (int x = threadIdx.x; x < n * DK; x += NT) {
             const int rr = x / DK, c = x % DK;
             const size_t base = ((size_t)(r0 + rr) * H + h) * DK + c;
@@ -304,6 +390,7 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
         }
         if (threadIdx.x < n) bt[threadIdx.x] = b_save[(r0 + threadIdx.x) * H + h];
         __syncthreads();
+#endif
         for (int rr = 0; rr < n; ++rr) {
             const float4 k4 = reinterpret_cast<const float4*>(kt[rr])[lane];      // one 16-byte load a lane:
             const float4 q4 = reinterpret_cast<const float4*>(qt[rr])[lane];      // no bank conflicts
@@ -311,6 +398,7 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
             const float4 v4 = reinterpret_cast<const float4*>(vt[rr])[lw];
             float kk[4] = {k4.x, k4.y, k4.z, k4.w}, qq[4] = {q4.x, q4.y, q4.z, q4.w};
             float gg[4] = {g4.x, g4.y, g4.z, g4.w}, vv[4] = {v4.x, v4.y, v4.z, v4.w};
+#ifdef KDA_STEP_PLAIN
             update(s, kk, gg, vv, 0, bt[rr]);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -320,6 +408,19 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
                 o = warp_sum(o);
                 if (lane == 0) y_out[((size_t)(r0 + rr) * H + h) * DV + warp * 4 + j] = __float2bfloat16_rn(o);
             }
+#else
+            update4(s, kk, gg, vv, bt[rr], lane);
+            float o[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                o[j] = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) o[j] = o[j] + s[j][i] * qq[i];
+            }
+            const float ot = scatter_sum4(o, lane);
+            if ((lane & 7) == 0)
+                y_out[((size_t)(r0 + rr) * H + h) * DV + warp * 4 + (lane >> 3)] = __float2bfloat16_rn(ot);
+#endif
         }
     }
     if (state_out != nullptr) {
@@ -408,7 +509,13 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
         ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), (float)lower,
         ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    constexpr int WARPS = 4, TR = 16;
+#ifndef KDA_STEP_WARPS
+#define KDA_STEP_WARPS 16          // 2 blocks a head: all 128 blocks resident at once (4 warps: 4 waves, 2.7x slower)
+#endif
+#ifndef KDA_STEP_TR
+#define KDA_STEP_TR 16
+#endif
+    constexpr int WARPS = KDA_STEP_WARPS, TR = KDA_STEP_TR;
     step_kernel<WARPS, TR><<<dim3((unsigned)H, DV / 4 / WARPS), WARPS * 32, 0, stream>>>(
         H, ptr<float>(state_in), ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
         ptr<float>(g_save), ptr<float>(b_save), (int)rows, ptr<__nv_bfloat16>(y_tmp), ptr<float>(state_out));

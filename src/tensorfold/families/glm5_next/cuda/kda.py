@@ -15,8 +15,9 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
-                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+    return load(name="tensorfold_glm_kda_v3", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+                extra_cuda_cflags=["-O3", "--fmad=false"] + __import__("os").environ.get("TF_KDA_FLAGS", "").replace(",", " ").split(),
+                verbose=False)
 
 
 class KDAScratch:
