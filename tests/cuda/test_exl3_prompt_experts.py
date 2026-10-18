@@ -59,7 +59,8 @@ def reference(ex, x, pick):
     return y
 
 
-@pytest.mark.parametrize("R,k2s", [(64, [8]), (700, [8]), (2048, [8]), (300, [6, 8, 12, 16]), (900, [8, 12])])
+@pytest.mark.parametrize("R,k2s", [(64, [8]), (700, [8]), (2048, [8]), (300, [6, 8, 12, 16]), (900, [8, 12]),
+                                   (512, [4]), (700, [4, 6]), (2048, [4, 6])])
 def test_prompt_matches_grouped(R, k2s):
     E, D, I, top = 129, 2560, 640, 10
     ex, g = _layer(E, D, I, k2s)
@@ -81,9 +82,11 @@ def test_prompt_matches_grouped(R, k2s):
     assert e_prompt < 1.05 * e_grouped + 1e-6, f"prompt kernel {e_prompt:.3e} vs grouped {e_grouped:.3e} from exact"
 
 
-def test_prompt_rows_independent_of_window():
+@pytest.mark.parametrize("k2s", [[8], [4, 6]])
+def test_prompt_rows_independent_of_window(k2s):
     E, D, I, top = 129, 2560, 640, 10
-    ex, g = _layer(E, D, I, [8])
+    ex, g = _layer(E, D, I, k2s)
+    assert X.prompt2_fits(ex)
     R = 512
     pick = _picks(R, E, top, g)
     x = (0.5 * torch.randn((R, D), device="cuda", generator=g)).bfloat16()
@@ -92,6 +95,9 @@ def test_prompt_rows_independent_of_window():
     part = X.routed(x[100:300].contiguous(), pick[100:300].contiguous(), None, ex, s, None, 200,
                     prompt=True).clone().view(200, top + 1, D)
     assert torch.equal(whole[100:300], part)          # bit for bit: a row's sums are its own
+    one = X.routed(x[7:8].contiguous(), pick[7:8].contiguous(), None, ex, s, None, 1,
+                   prompt=True).clone().view(1, top + 1, D)
+    assert torch.equal(whole[7:8], one)               # a single row too (a resumed prompt's short tail)
 
 
 def test_prompt_summed_is_the_weighted_slot_sum():

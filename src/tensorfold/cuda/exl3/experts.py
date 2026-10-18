@@ -232,7 +232,7 @@ def _ext2():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_prompt_moe_v3", sources=[str(here / "prompt_moe.cpp"), str(here / "prompt_moe.cu")],
+    return load(name="tensorfold_exl3_prompt_moe_v4", sources=[str(here / "prompt_moe.cpp"), str(here / "prompt_moe.cu")],
                 extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
 
 
@@ -248,13 +248,13 @@ def _ext2():
 PROMPT_KERNEL = os.environ.get("TF_EXL3_PROMPT_KERNEL", "2")
 PROMPT_DET = os.environ.get("TF_EXL3_PROMPT_DET", "1").strip().lower()
 PROMPT_DET = {"0": "0", "fast": "0", "y": "y", "2": "y"}.get(PROMPT_DET, "grid")
-P2_K2 = (8, 12, 16)                    # trellis widths the second generation takes (4, 6 and 8 bits)
+P2_K2 = (4, 6, 8, 12, 16)              # trellis widths the second generation takes (2, 3, 4, 6 and 8 bits)
 OUT_BUDGET = int(os.environ.get("TF_EXL3_OUT_BUDGET", str(8 << 20)))   # bytes of out the down launch adds into at once
 
 
 def prompt2_fits(ex: Exl3RoutedExperts) -> bool:
-    """The second generation's shapes: D and I in 128-blocks, gate and up of an expert at one width, every width 4, 6
-    or 8 bits."""
+    """The second generation's shapes: D and I in 128-blocks, gate and up of an expert at one width, every width 2, 3, 4, 6
+    or 8 bits (2 and 3: GLM-5.3)."""
 
     ok = getattr(ex, "_p2_fits", None)
     if ok is None:

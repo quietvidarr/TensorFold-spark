@@ -482,6 +482,8 @@ __global__ void __launch_bounds__(gu::NTHR, 2) gu_kernel(GuArgs g) {
     __syncthreads();
     if (reinterpret_cast<const int*>(sm)[0] < 0) return;
     switch (g.k2[e]) {
+        case 4: gu_body<CB, 4, NS>(sm, g, e, half_); break;     // 2-bit (GLM-5.3 mosaic)
+        case 6: gu_body<CB, 6, NS>(sm, g, e, half_); break;     // 3-bit
         case 8: gu_body<CB, 8, NS>(sm, g, e, half_); break;
         case 12: if constexpr (NS <= gu::depth(12)) gu_body<CB, 12, NS>(sm, g, e, half_); else __trap(); break;
         case 16: if constexpr (NS <= gu::depth(16)) gu_body<CB, 16, NS>(sm, g, e, half_); else __trap(); break;
@@ -668,6 +670,8 @@ __global__ void __launch_bounds__(dn::NTHR, 2) dn_kernel(DnArgs g) {
     __syncthreads();
     const int cb = blockIdx.z * gridDim.x + blockIdx.x;
     switch (g.k2[e]) {
+        case 4: dn_body<CB, 4, NS>(sm, g, e, cb); break;
+        case 6: dn_body<CB, 6, NS>(sm, g, e, cb); break;
         case 8: dn_body<CB, 8, NS>(sm, g, e, cb); break;
         case 12: if constexpr (NS <= dn::depth(12)) dn_body<CB, 12, NS>(sm, g, e, cb); else __trap(); break;
         case 16: if constexpr (NS <= dn::depth(16)) dn_body<CB, 16, NS>(sm, g, e, cb); else __trap(); break;
