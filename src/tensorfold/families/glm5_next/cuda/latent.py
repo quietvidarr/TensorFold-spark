@@ -386,20 +386,28 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
     return out
 
 
+from tensorfold.cuda.geometry import MLA_SPARSE_ATT_ROWS as SPARSE_ROWS   # rows a sparse launch takes (partials' size)
+
+
 def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
                      out: torch.Tensor, scale: float) -> None:
     """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone."""
     R, H, LW = qa.shape
     W = tokens.shape[1]
     nch = triton.cdiv(W, CHUNK)
-    n = nch * R * H
+    hb = head_block(R)              # the whole window's head block, whatever rows a launch takes: the same bits a row
+    step = min(R, SPARSE_ROWS)
+    n = nch * step * H
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
-    hb = head_block(R)
-    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
-    _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+    for r0 in range(0, R, step):
+        r1 = min(R, r0 + step)
+        q_, t_, c_, o_ = qa[r0:r1], tokens[r0:r1], counts[r0:r1], out[r0:r1]
+        _sparse_chunks[(r1 - r0, triton.cdiv(H, hb), nch)](q_, cache, t_, c_, po, pm, pl, r1 - r0, W=W, H=H, LW=LW,
+                                                           CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8,
+                                                           num_stages=1)
+        _merge[(r1 - r0, H)](po, pm, pl, o_, c_, r1 - r0, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 
 def chunks_for(length: int) -> int:

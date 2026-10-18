@@ -220,7 +220,8 @@ class GlmEngine:
 
         def main_geometry(text):
             geometry = mla_geometry(_target_text(text, self.load_mtp), world, MAX_ROWS,
-                                    minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.load_mtp)
+                                    minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.load_mtp,
+                                    packed=self.packed_exl3)
             if adapter_workspace:
                 from tensorfold.cuda.geometry import with_fixed
                 geometry = with_fixed(geometry, adapter_workspace)

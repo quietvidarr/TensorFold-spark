@@ -16,6 +16,7 @@ PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fracti
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
 MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
+MLA_SPARSE_ATT_ROWS = 1024  # GLM's prompt-chunk rows one sparse latent attention launch takes (its fp32 partials)
 
 
 def indexed_prefill_rows() -> int | None:
@@ -256,7 +257,7 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 mtp: bool | None = None) -> Geometry:
+                 mtp: bool | None = None, packed: bool = False) -> Geometry:
     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
@@ -282,7 +283,14 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     if (t.get("_quantization") or {}).get("quant_method") == "exl3":
         # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
         fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
-        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+        if packed:
+            # packed TP1 prompt chunks: the v2 prompt kernel's buffers only (forward.prompt_scratch: fp16 inputs and
+            # fp32 y of every pair, the grouping, gate/up's xd tiles); no split-K partials
+            pairs, experts = PREFILL_ROWS * slots, int(t["n_routed_experts"])
+            fixed += pairs * d * (2 + 4) + experts * PREFILL_ROWS * 4
+            fixed += (pairs // 128 + min(pairs, experts)) * 128 * width * 2
+        else:
+            fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
     def bytes_at(capacity: int) -> int:
@@ -308,7 +316,7 @@ def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> in
     # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
     select = min(PREFILL_ROWS, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + PREFILL_ROWS * 16 * (topk + 3)
     if latent:
-        return select + ((topk + 515) // 512) * PREFILL_ROWS * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
+        return select + ((topk + 515) // 512) * min(PREFILL_ROWS, MLA_SPARSE_ATT_ROWS) * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
 
