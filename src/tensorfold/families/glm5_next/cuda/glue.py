@@ -162,7 +162,7 @@ def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
            eps: float, hc_eps: float, iters: int) -> None:
-    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S]."""
+    """BF16 or packed-TP1 FP32 streams -> unchanged BF16 normed rows + xs, post and comb."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
@@ -199,13 +199,51 @@ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD
         tl.store(XOUT + r * (S * D) + s * D + d, v.to(tl.bfloat16))
 
 
+@triton.jit
+def _hc_post_fp32(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD: tl.constexpr,
+                  BLOCK: tl.constexpr):
+    """Native hc_mix.cu hc_apply: rounded post*y then ordered g=0..3 FP32 fmaf; FP32 store."""
+    r = tl.program_id(0)
+    cb = tl.program_id(1)
+    d = cb * BLOCK + tl.arange(0, BLOCK)
+    branch = tl.load(G + r * D + d).to(tl.float32)
+    # Load all streams before stores: xout may alias x, each CTA owns distinct d.
+    x0 = tl.load(X + r * (S * D) + d).to(tl.float32)
+    x1 = tl.load(X + r * (S * D) + D + d).to(tl.float32)
+    x2 = tl.load(X + r * (S * D) + 2 * D + d).to(tl.float32)
+    x3 = tl.load(X + r * (S * D) + 3 * D + d).to(tl.float32)
+    for s in tl.static_range(S):
+        c0 = tl.load(COMB + r * 16 + 0 * 4 + s)
+        c1 = tl.load(COMB + r * 16 + 1 * 4 + s)
+        c2 = tl.load(COMB + r * 16 + 2 * 4 + s)
+        c3 = tl.load(COMB + r * 16 + 3 * 4 + s)
+        ps = tl.load(POST + r * S + s)
+        v = ps * branch
+        v = tl.fma(c0, x0, v)
+        v = tl.fma(c1, x1, v)
+        v = tl.fma(c2, x2, v)
+        v = tl.fma(c3, x3, v)
+        tl.store(XOUT + r * (S * D) + s * D + d, v)
+
+
 def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
-            comb: torch.Tensor) -> None:
+            comb: torch.Tensor, *, fp32_residual: bool = False) -> None:
     """gathered: [world, R, D] fp32 partials (contiguous). x and xout may be the same tensor."""
 
     world, rows, d = gathered.shape
     s = x.shape[1] // d
     block = min(1024, d)
+    if fp32_residual:
+        if world != 1 or s != 4:
+            raise ValueError("FP32 mHC post requires packed TP1 with four streams")
+        if (any(t.dtype != torch.float32 or not t.is_contiguous() for t in (x, xout, gathered, post, comb))
+                or x.shape != (rows, 4 * d) or xout.shape != x.shape
+                or post.shape != (rows, 4) or comb.numel() != rows * 16
+                or d % block or block & (block - 1)):
+            raise ValueError("FP32 mHC post requires contiguous FP32 carrier/branch/post/comb and complete blocks")
+        _hc_post_fp32[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world,
+                                         BLOCK=block, num_warps=4, enable_fp_fusion=False)
+        return
     _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
                                  num_warps=4)
 

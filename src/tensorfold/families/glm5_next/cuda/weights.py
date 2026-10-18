@@ -1,9 +1,13 @@
-"""Load one rank of MLX affine 4-bit weights or EXL3 routed experts with BF16 elsewhere, preserving heads and quantization groups at split boundaries."""
+"""GLM weights: legacy split MLX/BF16 TP2, or intact packed EXL3 text TP1.
+
+Packed projection/expert execution delegates unchanged generic upstream EXL3;
+plain tensors retain stored dtype and norms retain their uncentered gamma.
+"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,17 +17,31 @@ from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
 from . import latent
+from .packed import PlainLinear, ComposedLinear, PlainAbsorb, resident_transform, workspace_bytes
+from tensorfold.cuda.exl3.linear import Exl3Linear
+from tensorfold.cuda.exl3 import experts as generic_exl3
 from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
 
 PREFIX = "model.language_model."
+Projection = Q4 | B16 | Exl3Linear | PlainLinear | ComposedLinear
 
 
-def bits_of(quant: dict) -> int:
-    """The checkpoint's one bit width; a mixed-bit encode (bits such as "mixed_k34_per_tensor") is refused by name."""
+# Routed-expert widths the packed mul1 path admits, in half-bits: 2-bit (the 2.05bpw base) and 3-bit (layers a
+# mosaic takes from the 3.05bpw pack). The grouped kernel reads a width per expert, so mixing them is a table entry.
+PACKED_EXPERT_K2 = (4, 6)
+# (layer, half-bits) -> expert projections loaded at that width; read back by the loader census
+EXPERT_K2_CENSUS: dict = {}
+
+
+def bits_of(quant: dict) -> float:
+    """The checkpoint's one bit width (a packed EXL3 encode names a fraction, such as 2.05); a mixed-bit encode
+    (bits such as "mixed_k34_per_tensor") is refused by name."""
 
     bits = quant.get("bits", 4)
-    if isinstance(bits, int) or (isinstance(bits, str) and bits.isdigit()):
-        return int(bits)
+    if isinstance(bits, (int, float)) and not isinstance(bits, bool):
+        return float(bits)
+    if isinstance(bits, str) and bits.replace(".", "", 1).isdigit():
+        return float(bits)
     raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads one bit width a "
                      "checkpoint, so mixed-bit EXL3 encodes are not supported yet")
 
@@ -63,7 +81,7 @@ class Config:
     eos: tuple[int, ...]
     mtp_layers: int
     group_size: int
-    bits: int
+    bits: float
     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
 
     @classmethod
@@ -121,14 +139,14 @@ class HCW:
 
 @dataclass
 class KDAW:
-    proj: Q4                  # [q | k | v | f_a | g_a | b]
-    fb: Q4
-    gb: Q4
+    proj: Projection                  # [q | k | v | f_a | g_a | b]
+    fb: Projection
+    gb: Projection
     conv: torch.Tensor        # [3 HL 128, taps] bf16
     a_log: torch.Tensor       # [HL] fp32
     dt_bias: torch.Tensor     # [HL 128] fp32
     norm: torch.Tensor        # [128] bf16
-    o: Q4
+    o: Projection
     heads: int
 
     @property
@@ -148,8 +166,8 @@ class KDAW:
 class IndexW:
     """Replicated DSA indexer weights include key and query projections, head weights, key LayerNorm, pool gates, and pool position bias."""
 
-    kw: Q4
-    qb: Q4
+    kw: Projection
+    qb: Projection
     ln_w: torch.Tensor
     ln_b: torch.Tensor
     gate: torch.Tensor
@@ -158,13 +176,13 @@ class IndexW:
 
 @dataclass
 class DSAW:
-    proj: Q4                  # [q_a | kv_a]
+    proj: Projection                  # [q_a | kv_a]
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
-    q_b: Q4
-    kv_k: Q4                  # key rows of kv_b for the local heads
-    kv_v: Q4                  # value rows
-    o: Q4
+    q_b: Projection
+    kv_k: Projection                  # key rows of kv_b for the local heads
+    kv_v: Projection                  # value rows
+    o: Projection
     heads: int
     index: IndexW | None = None
     absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
@@ -172,8 +190,8 @@ class DSAW:
 
 @dataclass
 class MLPW:
-    gu: Q4                    # [gate | up]
-    down: Q4
+    gu: Projection                    # [gate | up]
+    down: Projection
     width: int
 
 
@@ -181,7 +199,7 @@ class MLPW:
 class MoEW:
     router: torch.Tensor      # [E, D] bf16
     bias: torch.Tensor        # [E] fp32
-    experts: grouped.Experts | Exl3Experts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
+    experts: grouped.Experts | Exl3Experts | generic_exl3.Exl3RoutedExperts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
     shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
 
 
@@ -203,7 +221,7 @@ class LayerW:
 class MTPW:
     enorm: torch.Tensor
     hnorm: torch.Tensor
-    eh: Q4                    # [D, 2D]: input [embedding | hidden]
+    eh: Projection                    # [D, 2D]: input [embedding | hidden]
     norm: torch.Tensor        # shared_head.norm
     layer: LayerW             # DSA + MoE, plain residual (no hyper-connections)
 
@@ -211,10 +229,10 @@ class MTPW:
 @dataclass
 class Weights:
     cfg: Config
-    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor
     layers: list[LayerW]
     norm: torch.Tensor
-    head: Q4 | B16
+    head: Projection
     mtp: MTPW | None
     rank: int
     world: int
@@ -233,10 +251,15 @@ class Weights:
 
         def add(t):
             nonlocal total
-            if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
-                seen.add(t.data_ptr())
-                total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            if isinstance(t, torch.Tensor):
+                storage = t.untyped_storage()
+                key = (str(t.device), storage.data_ptr())
+                if key not in seen:
+                    seen.add(key)
+                    total += storage.nbytes()
+            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, generic_exl3.Exl3RoutedExperts, Exl3Linear,
+                                PlainLinear, ComposedLinear, PlainAbsorb, latent.AbsorbW, latent.AbsorbQ4,
+                                HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -255,18 +278,34 @@ class Weights:
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
-    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
+def packed_residency(cfg: Config, *, load_mtp: bool = True):
+    """Quant-aware full packed TP1 transform; scratch is separately budgeted."""
+    return resident_transform(cfg, load_mtp=load_mtp)
+
+
+def load(model_dir: str | Path, *, rank: int, device: str = "cuda", world: int = 2,
+         load_mtp: bool = True, mtp: bool | None = None) -> Weights:
+    """Load full packed TP1 or the legacy rank-split TP2 path; MTP is explicit (``mtp`` is upstream's name for it)."""
 
     from .split import RankReader
 
-    world = 2
+    if mtp is not None:
+        load_mtp = bool(mtp)
+
+    if world not in (1, 2) or not 0 <= rank < world:
+        raise ValueError("GLM requires world=1/rank=0 or world=2/rank=0..1")
     cfg = Config.read(model_dir)
+    if not load_mtp:
+        cfg = replace(cfg, mtp_layers=0)
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
-    rd = RankReader(model_dir, rank)
+    rd = RankReader(model_dir, rank, world=world)
+    packed = exl3 and "lm_head.trellis" in rd.index
+    if packed and world != 1:
+        rd.close()
+        raise ValueError("intact packed GLM requires world=1; legacy TP2 remains unchanged")
     HL = cfg.heads // world
     LL = cfg.lin_heads // world
 
@@ -279,10 +318,26 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
-    def q4(name: str) -> Q4 | B16:
+    def projection(full: str):
+        if full + ".trellis" in rd.index:
+            markers = [cb for cb in ("mul1", "mcg", "3inst") if full + "." + cb in rd.index]
+            if len(markers) != 1:
+                raise ValueError(f"{full}: need exactly one EXL3 codebook marker")
+            def get(part):
+                return rd.get(full + "." + part)
+            # Stored layout preserves raw packed bytes, no reordered duplicate.
+            return Exl3Linear.from_tensors(get("trellis"), get("suh"), get("svh"),
+                                           markers[0], device=dev, layout="stored")
+        return PlainLinear(rd.get(full + ".weight").to(dev))
+
+    def q4(name: str):
+        if packed:
+            return projection(PREFIX + name)
         return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
 
-    def stack(names: list[str]) -> Q4 | B16:
+    def stack(names: list[str]):
+        if packed:
+            return ComposedLinear([q4(n) for n in names])
         if exl3:
             return stack_b16([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
@@ -293,8 +348,14 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def kda(i: int) -> KDAW:
         p = f"layers.{i}.self_attn."
-        proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
-        conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
+        if packed:
+            proj = stack([p + "qkv_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
+            conv = t(p + "conv1d.weight").reshape(3 * LL * 128, cfg.conv).contiguous()
+            if proj.parts[0].n != 3 * LL * 128:
+                raise ValueError("fused qkv does not contain the complete local head set")
+        else:
+            proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
+            conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
         return KDAW(proj, q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
                     t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), q4(p + "o_proj"), LL)
 
@@ -303,7 +364,15 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
-        if exl3:
+        if packed:
+            # Head-major K/V split AFTER ordinary plain matrix read. Keep F16
+            # blocks once, alias expanded projections to the same storage.
+            w = t(p + "kv_b_proj.weight").reshape(HL, cfg.qk_dim + cfg.v_dim, cfg.kv_lora)
+            wk = w[:, :cfg.qk_dim].contiguous()
+            wv = w[:, cfg.qk_dim:].contiguous()
+            kv_k = PlainLinear(wk.view(HL * cfg.qk_dim, cfg.kv_lora))
+            kv_v = PlainLinear(wv.view(HL * cfg.v_dim, cfg.kv_lora))
+        elif exl3:
             w = t(p + "kv_b_proj.weight")
             kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
@@ -313,6 +382,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
+        elif packed:
+            absorb = PlainAbsorb(wk, wv)
         elif exl3:
             absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
@@ -322,8 +393,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
                                               latent.dequant_mlx4(w[vrows], s[vrows], b[vrows], cfg.group_size), HL)
         ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"]), q4(p + "indexer.wq_b"),
                     t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"),
-                    t(p + "indexer.index_kpool_compress_gate", torch.bfloat16).contiguous(),
-                    t(p + "indexer.index_kpool_compress_ape", torch.bfloat16).contiguous())
+                    t(p + "indexer.index_kpool_compress_gate", None if packed else torch.bfloat16).contiguous(),
+                    t(p + "indexer.index_kpool_compress_ape", None if packed else torch.bfloat16).contiguous())
         return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"),
                     kv_k, kv_v, q4(p + "o_proj"), HL, ix, absorb)
 
@@ -334,7 +405,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def expert_names(i: int) -> list[str]:
         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""
 
-        mtp_layer = i == cfg.layers and cfg.mtp_layers and mtp
+        mtp_layer = i == cfg.layers and cfg.mtp_layers and load_mtp
         if not mtp_layer and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
             return []
         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
@@ -372,8 +443,26 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def moe(i: int) -> MoEW:
         p = f"layers.{i}.mlp."
-        router = t(p + "gate.weight", torch.bfloat16).contiguous()
+        router = t(p + "gate.weight", None if packed else torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+        if packed:
+            parts = []
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                mats = []
+                for e in range(cfg.experts):
+                    full = PREFIX + p + f"experts.{e}.{proj}"
+                    if full + ".mul1" not in rd.index:
+                        raise ValueError(f"{full}: packed GLM expects mul1 experts")
+                    tr = rd.get(full + ".trellis").to(dev).contiguous()
+                    k2 = generic_exl3.k2_of(tr)
+                    if k2 not in PACKED_EXPERT_K2:
+                        raise ValueError(f"{full}: expert width {k2 / 2} bits is outside the packed GLM "
+                                         f"widths {sorted(k / 2 for k in PACKED_EXPERT_K2)}")
+                    EXPERT_K2_CENSUS[(i, k2)] = EXPERT_K2_CENSUS.get((i, k2), 0) + 1
+                    mats.append((tr, rd.get(full + ".suh"), rd.get(full + ".svh")))
+                parts.append(mats)
+            ex = generic_exl3.prepare(*parts, "mul1", device=dev)
+            return MoEW(router, bias, ex, mlp(p + "shared_experts."))
         if exl3:
             return MoEW(router, bias, moe_exl3(p), mlp(p + "shared_experts."))
         parts = {}
@@ -413,36 +502,44 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         else:
             lw.moe = moe(i)
         if i % 8 == 7:                            # each release waits for the device; a layer leaves few temporaries
-            torch.cuda.empty_cache()
-        layer_events.append(torch.cuda.current_stream().record_event())
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+        if dev.type == "cuda":
+            layer_events.append(torch.cuda.current_stream().record_event())
         return lw
 
-    if exl3:
-        embed = rd.get(PREFIX + "embed_tokens.weight").to(torch.bfloat16).contiguous().to(dev)
-    else:
-        embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
-                 rd.get(PREFIX + "embed_tokens.biases").to(dev))
     try:                                          # a failed load still cancels the reads queued ahead
+        if exl3:
+            embed = rd.get(PREFIX + "embed_tokens.weight").to(torch.bfloat16).contiguous().to(dev)
+        else:
+            embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
+                     rd.get(PREFIX + "embed_tokens.biases").to(dev))
         which = list(range(cfg.layers))
         built = [layer(i) for i in which]
         vl = cfg.vocab // world
         draft_head = None
-        if exl3:
+        if packed:
+            head = projection("lm_head")
+            if head.n != cfg.vocab:
+                raise ValueError("packed head must retain the full vocabulary")
+        elif exl3:
             head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            # Omitted MTP must not retain an unbudgeted, unused draft-head copy.
+            if load_mtp:
+                draft_head = quantize4(head.weight)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
                            hb[rank * vl:(rank + 1) * vl].to(dev))
         mtpw = None
-        if cfg.mtp_layers and mtp:
+        if cfg.mtp_layers and load_mtp:
             i = cfg.layers
             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
-        w.meta.update(layers=which)
+        w.meta.update(layers=which, packed_exl3=packed, load_mtp=load_mtp)
     finally:
         rd.close()
-    torch.cuda.empty_cache()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
     return w

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 import uuid
@@ -162,18 +163,47 @@ def make_handler(app: App):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                writing = threading.Lock()                   # the reply's chunks and the keep-alives share one socket
+                written = [time.monotonic()]
+
                 def emit(delta: dict[str, Any]) -> bool:
                     try:
-                        self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
-                        self.wfile.flush()
+                        with writing:
+                            self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
+                            self.wfile.flush()
+                            written[0] = time.monotonic()
                         return True
                     except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
                         return False
 
+                # A queued or prefilling request writes nothing. An empty chunk every ``keepalive_seconds`` keeps a
+                # client's idle timer quiet, and a failed one finds the client that left (behind a proxy too).
+                # Chat keep-alives carry an empty content delta: some clients (pi-ai) do not count a bare {} delta as activity.
+                every = float(getattr(app, "keepalive_seconds", 0) or 0)
+                done = threading.Event()
+
+                def keepalive() -> None:
+                    while not done.wait(min(1.0, every)):
+                        if time.monotonic() - written[0] >= every and not emit({"content": ""} if chat else {}):
+                            gone.cancel()
+                            return
+
+                beat = threading.Thread(target=keepalive, name="keepalive", daemon=True) if every > 0 else None
+
+                def quiet() -> None:
+                    done.set()
+                    if beat is not None and beat.is_alive():
+                        beat.join(timeout=5.0)
+
                 if chat:
                     emit({"role": "assistant"})
+                if beat is not None:
+                    beat.start()
                 try:
-                    result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+                    try:
+                        result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+                    finally:
+                        quiet()                          # no keep-alive may follow the reply's own last chunks
                 except RequestCancelled:
                     self.close_connection = True
                     return

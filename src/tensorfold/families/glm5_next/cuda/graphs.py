@@ -26,6 +26,7 @@ class Graphs:
         self.sparse: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}      # (rows, parity, pool bucket)
         self.sparse_mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}       # (rows, pool bucket)
         w, st = e.w, e.st
+        self.load_mtp = w.mtp is not None and not w.meta.get("target_only", False) and w.meta.get("load_mtp", True)
         prof.active = False
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)
@@ -41,7 +42,7 @@ class Graphs:
                         compute(w, st, e.buf, R)
                     self.main[(R, parity)] = g
             st.cur = saved
-            if w.mtp is not None:
+            if self.load_mtp:
                 e.mbuf.zero_first = False
                 for n in mtp_rows:
                     for _ in range(2):
@@ -70,7 +71,7 @@ class Graphs:
                     with torch.cuda.graph(g, pool=self.pool):
                         compute(w, st, e.buf, R, sparse_np=bucket)
                     self.sparse[(R, parity, bucket)] = g
-            if w.mtp is not None:
+            if self.load_mtp:
                 for n in mtp_rows:
                     for _ in range(2):
                         mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)

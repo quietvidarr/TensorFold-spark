@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash (model_type ``glm5_next``): an MLX engine on a 256 GB Mac, a CUDA engine over two DGX Sparks."""
+"""GLM-5.3-Flash (model_type ``glm5_next``): MLX on Mac, singleton or legacy TP2 CUDA."""
 
 from __future__ import annotations
 
@@ -19,6 +19,16 @@ KERNEL_VERSION = "v1"
 QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
 # the EXL3 variant the CUDA kernels read (4-bit trellis, the "mcg" codebook, routed experts only)
 EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
+# Narrow independently integrated packed profile. Average bits selects a profile, not per-tensor widths.
+PACKED_EXL3_VARIANT = {"bits": 2.05, "codebook": "mul1", "head_bits": 5, "out_scales": "always"}
+
+
+def _packed_exl3(config: dict) -> bool:
+    found = config.get("quantization_config") or config.get("quantization") or {}
+    return (found.get("quant_method") == "exl3" and not found.get("scope") and
+            {key: found.get(key) for key in PACKED_EXL3_VARIANT} == PACKED_EXL3_VARIANT)
+
+
 # buffers of 200 ops and 200 MB, so a prompt chunk's memory frees as it runs; no TF32: row kernels repeat fp32
 MLX_ENV = {"MLX_MAX_OPS_PER_BUFFER": "200", "MLX_MAX_MB_PER_BUFFER": "200", "MLX_ENABLE_TF32": "0"}
 
@@ -30,7 +40,7 @@ def _mac_reads(fmt: tuple) -> bool:
 
 
 def check(model_dir: str | Path) -> None:
-    """Refuse what neither engine reads: MLX affine weights on a Mac; those or Mia's EXL3 layout on two GPUs."""
+    """Refuse unknown layouts; packed-profile config acceptance does not imply CUDA numerical qualification."""
 
     import sys
 
@@ -47,12 +57,17 @@ def check(model_dir: str | Path) -> None:
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
         got = {k: found.get(k) for k in EXL3_VARIANT}
-        if {k: (int(v) if k == "bits" and v is not None else v) for k, v in got.items()} != EXL3_VARIANT:
+        packed = _packed_exl3(config)
+        if got != EXL3_VARIANT and not packed:
             raise ValueError(f"GLM-5.3-Flash's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed "
                              f"experts and BF16 elsewhere ({MODELS[1]}); this one has "
                              + ", ".join(f"{k} {v}" for k, v in got.items()) + f". {OWN_MODEL_HELP}")
-        print("[tensorfold] EXL3 support is experimental: replies are exact, but the MLX checkpoint "
-              f"({MODELS[0]}) is tested more and runs faster (docs/recipes/glm-5.3-flash.md)", flush=True)
+        if packed:
+            print("[tensorfold] experimental packed mul1 GLM profile: TP1 only; CUDA numerical qualification "
+                  "is required before deployment", flush=True)
+        else:
+            print("[tensorfold] legacy EXL3 support is experimental: replies are exact, but the MLX checkpoint "
+                  f"({MODELS[0]}) is tested more and runs faster (docs/recipes/glm-5.3-flash.md)", flush=True)
     elif quantization(config) != (4, 64) and not (sys.platform == "darwin" and _mac_reads(quantization(config))):
         raise ValueError(f"GLM-5.3-Flash's Mac engine reads MLX affine weights of 2 to 8 bits in groups of 32, 64 or "
                          f"128 ({MODELS[0]} is 4-bit in groups of 64), and the CUDA engine 4-bit groups of 64 or "
@@ -88,8 +103,8 @@ def check(model_dir: str | Path) -> None:
             print(f"[tensorfold] this checkpoint has no MTP layer: decoding without MTP drafts ({MODELS[0]} has "
                   f"one)", flush=True)
         return
-    print("[tensorfold] GLM-5.3-Flash runs on two NVIDIA GPUs with 128 GB each (two DGX Sparks): pull it on both "
-          "and serve with --tp 2 on both (docs/recipes/glm-5.3-flash.md)", flush=True)
+    print("[tensorfold] GLM CUDA supports TP1/rank0 or legacy TP2; startup admission checks the requested "
+          "window before weight loading", flush=True)
 
 
 def has_mtp(model_dir: str | Path) -> bool:
@@ -203,14 +218,25 @@ CUDA_QUANTIZATION = (4, 64)
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
-    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
+                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
+                target_only: bool = False, eager: bool = False, **options: Any):
+    """Build singleton or legacy TP2 execution; target-only omits all draft weights and work."""
 
-    if int(tp) != 2:
-        raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
-                         "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
-    if not master:
+    tp, rank = int(tp), int(rank)
+    if tp not in (1, 2) or not 0 <= rank < tp:
+        raise ValueError("GLM requires --tp 1 --rank 0 or --tp 2 --rank 0/1")
+    if tp == 2 and not master:
         raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+    if options.get("vision"):
+        raise ValueError("GLM CUDA integration is text-only; vision is not supported")
+    path = Path(model_dir)
+    if tp == 1 and any(path.glob("*.rank*.safetensors")):
+        raise ValueError("TP1 requires a full unsplit checkpoint, not a half-rank folder")
+    if tp == 2 and (path / "config.json").is_file():
+        import json
+        if _packed_exl3(json.loads((path / "config.json").read_text())):
+            raise ValueError("packed mul1 GLM requires TP1; packed TP2 slicing is not implemented")
+    no_drafts = bool(no_drafts or target_only)
     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
 
     if mtp_drafts is None:
@@ -219,10 +245,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
     else:
         policy = str(int(mtp_drafts))
-    return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
+    return GlmEngine(Path(model_dir), rank=rank, world=tp, master=master, port=int(master_port), policy=policy,
                      drafter=Path(drafter) if drafter and not no_drafts else None,
                      context=options.get("context"), context_explicit=options.get("context_explicit"),
-                     serial_only=bool(no_drafts))
+                     serial_only=bool(no_drafts), target_only=bool(target_only), eager=bool(eager),
+                     prefill_rows=options.get("prefill_rows"), calibrate=bool(options.get("calibrate", True)))
 
 
 def __getattr__(name: str) -> Any:

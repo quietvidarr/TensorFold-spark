@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "budget": 3000,
+  "repeat_ngram": 8,
+  "repeat_count": 3,
+  "repeat_window": 512,
+  "variety_window": 256,
+  "variety_fraction": 0.25,
+  "grace_tokens": 48,
+  "answer_reserve": 1024,
+  "bias_start_fraction": 0.5,
+  "bias_max": 8.0,
+  "repeat_min_thinking_tokens": 1500,
+  "repeat_arithmetic_fraction": 0.75,
+  "answer_max_tokens": 2048,
+  "thinking_triggers": false,
+  "answer_guard": false,
+  "collapse_max_distinct": 4,
+  "collapse_min_eligible": 64,
+  "collapse_ban_tokens": 256
+}

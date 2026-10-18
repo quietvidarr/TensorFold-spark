@@ -51,7 +51,10 @@ class PreparedRequest:
     stop: tuple[str, ...] = ()
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
-    think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+    think_budget: int = 0   # legacy gate, unused by the GLM soft landing
+    landing_config: Any = None  # request-local copied-runtime thinking-loop policy
+    landing_state: Any = None   # retained across cooperative/gated continuations
+    prefix_cache: bool = True   # resume from the live prompt state when it is a strict prefix of this prompt
 
 
 def _native_context(model_dir: Path) -> int:

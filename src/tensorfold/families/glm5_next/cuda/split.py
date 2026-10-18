@@ -71,10 +71,31 @@ def read_header(path: str | Path) -> tuple[dict, int]:
     return header, 8 + n
 
 
-def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int) -> tuple[np.ndarray, list[int]]:
-    """A tensor's bytes -> rank's part of them and its shape."""
+def validate_world(world: int, rank: int) -> None:
+    if world not in (1, 2) or not 0 <= rank < world:
+        raise ValueError(f"GLM supports world=1/rank=0 or world=2/rank=0,1, got world={world}, rank={rank}")
 
-    if kind == "rep":
+
+def require_full_checkpoint(model_dir: str | Path, world: int) -> None:
+    if world != 1:
+        return
+    path = Path(model_dir)
+    split = any(path.glob("*.rank*.safetensors"))
+    index = path / "model.safetensors.index.json"
+    if index.is_file():
+        split |= any(".rank" in Path(name).name for name in json.loads(index.read_text())["weight_map"].values())
+    if split:
+        raise ValueError("TP1 requires a full unsplit checkpoint, not a half-rank folder")
+
+
+def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int,
+                world: int = 2) -> tuple[np.ndarray, list[int]]:
+    """A tensor's bytes -> rank's part of them and its shape; TP1 keeps full packed groups."""
+
+    validate_world(world, rank)
+    if kind not in ("rep", "row", "col", "dim1"):
+        raise ValueError(kind)
+    if world == 1 or kind == "rep":
         return raw, list(shape)
     if kind == "row":
         rows = shape[0]
@@ -101,10 +122,13 @@ def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, ran
     raise ValueError(kind)
 
 
-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
-    """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
+def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, world: int = 2):
+    """``split_bytes`` for a uint8 tensor on the device, with independently owned storage."""
 
-    if kind == "rep":
+    validate_world(world, rank)
+    if kind not in ("rep", "row", "col", "dim1"):
+        raise ValueError(kind)
+    if world == 1 or kind == "rep":
         return raw.clone(), list(shape)
     if kind == "row":
         if shape[0] % 2:
@@ -136,16 +160,18 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
 class RankReader:
     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
 
-    def __init__(self, model_dir: str | Path, rank: int) -> None:
+    def __init__(self, model_dir: str | Path, rank: int, world: int = 2) -> None:
+        validate_world(world, rank)
+        require_full_checkpoint(model_dir, world)
         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
 
-        self.dir, self.rank = Path(model_dir), rank
-        self.io = Reader()                                # O_DIRECT reads where the file system allows them
-        self.reads = ReadAhead(self.io, READERS, RUN, GAP)
+        self.dir, self.rank, self.world = Path(model_dir), rank, world
         mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
         if other and not mine:
             raise ValueError(f"{self.dir} holds rank {1 - rank}'s share: give rank {rank} its own folder or the "
                              "full checkpoint")
+        self.io = Reader()                                # O_DIRECT reads where the file system allows them
+        self.reads = ReadAhead(self.io, READERS, RUN, GAP)
         self.split = bool(mine)
         if self.split:
             self.folder = SafeTensors(mine, self.io)
@@ -191,14 +217,15 @@ class RankReader:
             self.files[file] = read_header(file)
         header, base = self.files[file]
         info = header[name]
-        kind = rule(name)
+        # Singleton packed tile axes are not ordinary matrix rows. Loader validates text formats.
+        kind = ("drop" if name.startswith("model.visual.") else "rep") if self.world == 1 else rule(name)
         if kind == "drop":
             raise KeyError(f"{name} is not used by the engine")
         a, b = info["data_offsets"]
         shape = list(info["shape"])
-        if kind == "row" and shape and shape[0] % 2 == 0:   # the rank's rows are one run: read only those
-            per = (b - a) // shape[0] * (shape[0] // 2)
-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // 2] + shape[1:]
+        if self.world > 1 and kind == "row" and shape and shape[0] % self.world == 0:
+            per = (b - a) // shape[0] * (shape[0] // self.world)
+            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // self.world] + shape[1:]
         return file, base + a, base + b, kind, shape, info["dtype"]
 
     def _tensor(self, raw: np.ndarray, span: tuple, own: bool):
@@ -207,7 +234,7 @@ class RankReader:
         import torch
 
         _, _, _, kind, shape, dtype = span
-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, world=self.world)
         if own and np.may_share_memory(data, raw):
             data = data.copy()
         return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
@@ -224,7 +251,7 @@ class RankReader:
         if not raw.is_cuda:
             return self._tensor(raw.numpy(), span, own=True)
         _, _, _, kind, shape, dtype = span
-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, world=self.world)
         return data.view(torch_dtype(dtype)).reshape(shape)
 
 def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:

@@ -124,6 +124,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                        help="don't ask GitHub whether a newer release exists (also TENSORFOLD_NO_UPDATE_CHECK=1)")
 
     cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
+    cuda.add_argument("--target-only", action="store_true",
+                      help="GLM CUDA: omit MTP/vision/drafters and retained prefixes; serial target execution")
+    cuda.add_argument("--eager", action="store_true",
+                      help="GLM CUDA: no graph capture or startup calibration (fixed policies only)")
     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                       help="auto: MLX on macOS, CUDA elsewhere")
     cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,

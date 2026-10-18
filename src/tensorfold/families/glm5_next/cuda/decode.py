@@ -131,6 +131,8 @@ class Engine:
     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""
 
+        if self.mbuf is None:
+            raise ValueError("MTP weights/work were explicitly omitted")
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
         g, kind = None, "mtp"
@@ -152,8 +154,38 @@ class Engine:
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None, *,
                draft: bool = False, probs: list[float] | None = None) -> list[int]:
         if not draft and self.constraint is not None and self.window is not None:
+            logits = logits.float().clone()  # grammar masks must not alter graph-owned buffers either
             self.constraint.mask(logits, self.window, self.w.vocab_offset)   # this rank's vocabulary columns
             self.window = None
+        landing = getattr(self, "thinking_landing", None)
+        if landing is not None and landing.config.enabled:
+            if not draft and logits.shape[0] != 1:
+                raise ValueError("Thinking landing requires token-serial target sampling")
+            # Proposals can use the current bias/masks, but never forced IDs or
+            # observer advancement. Only committed target tokens consume queues.
+            forced = landing.next_forced() if not draft else None
+            if forced is not None:
+                return [forced]  # emitted normally, then assimilated by the next target forward
+            bias = landing.close_bias()
+            if landing.thinking or landing.closed or bias:
+                logits = logits.float().clone()  # never mutate persistent graph output buffers
+                offset = self.w.vocab_offset
+                def mask(token):
+                    column = token - offset
+                    if 0 <= column < logits.shape[1]:
+                        logits[:, column] = -float("inf")
+                if landing.closed or landing.thinking:
+                    mask(landing.open_id)  # no nested/reopened block
+                if landing.closed:
+                    mask(landing.close_id)  # a completed block cannot be closed twice
+                for token in getattr(landing, "banned_ids", ()):
+                    mask(token)  # a collapsed loop's word tokens, for a bounded span
+                if landing.thinking:
+                    for token in self.w.cfg.eos:
+                        mask(token)  # reasoning must close before a reply may finish
+                    column = landing.close_id - offset
+                    if bias and 0 <= column < logits.shape[1]:
+                        logits[:, column] += bias
         return sample_rows(self.w, logits, positions, sampling, None, probs)
 
     def verify_window(self, tokens: list[int]) -> list[int]:
@@ -341,13 +373,17 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
+            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, stop=None) -> int:
+    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state.
+
+    ``stop()`` is asked before each chunk: once it holds, the prompt is abandoned with ``RequestCancelled`` and
+    the caller must reset the engine before its next prompt.
+    """
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
-    use_mtp = mtp and w.mtp is not None
+    use_mtp = mtp and w.mtp is not None and w.cfg.mtp_layers > 0
     begin = 0
     if resume is None:
         e.reset()
@@ -363,14 +399,20 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp:
             k = resume.pending.shape[0]
             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
-    from .forward import Cut
+    if keep_at is not None:                              # only a kept prefix cuts a chunk at an interior row
+        from .forward import Cut
 
-    if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
-        raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
+        if keep is None or not max(1, begin) <= keep_at <= len(prompt):
+            raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
     kept = resume if keep_at == begin else None
     last = None
     prof.active = True
     for start in range(begin, len(prompt), e.prefill_rows):
+        if stop is not None and stop():
+            from tensorfold.server.cancellation import RequestCancelled
+
+            prof.active = False
+            raise RequestCancelled("the client left while its prompt was filling")
         chunk = list(prompt[start:start + e.prefill_rows])
         R = len(chunk)
         point = keep_at - start if keep_at is not None else 0

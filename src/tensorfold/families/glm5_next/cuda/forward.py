@@ -15,7 +15,9 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
+from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse, packed
+from .prefill import routed_micro_windows
+from tensorfold.cuda.exl3 import experts as generic_exl3
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -58,9 +60,10 @@ class Buffers:
             width = kda_layers[0].kda.proj.n if kda_layers else 0
             self.kproj = torch.zeros((1, rows, width), dtype=bf, device=dev)
             self.kscratch = kda_mod.KDAScratch(rows, LL, dev)
-        self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
+        self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev) if w.mtp is not None else None
         self.zero_first = False          # MTP: this step starts at position 0 (its embedding is zeroed)
-        self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
+        self.fp32_residual = packed.fp32_residual(w)
+        self.x = torch.empty((rows, S * D), dtype=f32 if self.fp32_residual else bf, device=dev)
         self.normed = torch.empty((rows, D), dtype=bf, device=dev)
         self.xs = torch.empty((rows, D // 64), dtype=f32, device=dev)
         self.post = torch.empty((rows, S), dtype=f32, device=dev)
@@ -104,9 +107,16 @@ class Buffers:
         self.exl3 = None
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
-            shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
-            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
-            self.ey = self.exl3.y.view(rows, slots, D)
+            if w.meta.get("packed_exl3"):
+                # packed TP1: a prompt chunk's routed experts run in windows of up to 128 rows, copied into ey
+                ex = next((l.moe.experts for l in w.layers if l.moe is not None),
+                          w.mtp.layer.moe.experts if w.mtp is not None else None)
+                self.exl3 = generic_exl3.Scratch(ex, min(rows, 128), slots, device=dev) if ex is not None else None
+                self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
+            else:
+                shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+                self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
+                self.ey = self.exl3.y.view(rows, slots, D)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
@@ -114,23 +124,27 @@ class Buffers:
         # rank partials
         self.part = torch.empty((rows, D), dtype=f32, device=dev)
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
-        self.sk = torch.empty((1 if prefill and not exl3 else 8 * rows * 16384,), dtype=f32, device=dev)
+        self.sk = torch.empty((1 if w.meta.get("packed_exl3") or (prefill and not exl3) else 8 * rows * 16384,), dtype=f32, device=dev)
         # final
         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
         self.fxs = torch.empty((rows, D // 64), dtype=f32, device=dev)
         self.logits = torch.empty((head_rows, w.head.n), dtype=bf, device=dev)
         # MTP
-        self.me = torch.empty((rows, D), dtype=bf, device=dev)
-        self.mcat = torch.empty((rows, 2 * D), dtype=bf, device=dev)
-        self.mxs = torch.empty((rows, 2 * D // 64), dtype=f32, device=dev)
-        self.mx = torch.empty((rows, D), dtype=bf, device=dev)
+        self.me = self.mcat = self.mxs = self.mx = None
+        if w.mtp is not None:
+            self.me = torch.empty((rows, D), dtype=bf, device=dev)
+            self.mcat = torch.empty((rows, 2 * D), dtype=bf, device=dev)
+            self.mxs = torch.empty((rows, 2 * D // 64), dtype=f32, device=dev)
+            self.mx = torch.empty((rows, D), dtype=bf, device=dev)
         self._parents: dict[int, torch.Tensor] = {}
         # DFlash2 taps: the mean of the streams after chosen layers (``set_taps``), filled by every forward
         self.taps: list[torch.Tensor] = []
         self.tap_at: dict[int, list[int]] = {}
         self.experts = c.experts
         self.top_k = c.top_k
+        self.projection_scratch = (packed.ProjectionScratch(list(packed.projections(w)), rows, dev, prefill)
+                                   if w.meta.get("packed_exl3") else None)
 
     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
         self.tap_at = {}
@@ -247,6 +261,8 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
 def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
+    if isinstance(q, (packed.PlainLinear, packed.ComposedLinear, packed.Exl3Linear)):
+        return packed.matmul(q, x, out, b.projection_scratch)
     if b.prefill and isinstance(q, qmm.Q4):
         return shared.prefill_matmul(x, q, f32=f32, out=out)
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
@@ -311,7 +327,10 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
         ik, ig, pk = index
         ix = a.index
         mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
-        glue.router(b.normed[:R], ix.gate, b.igr[:R])
+        if w.meta.get("packed_exl3"):
+            mm(b, b.normed[:R], packed.PlainLinear(ix.gate), None, b.igr[:R], f32=True)
+        else:
+            glue.router(b.normed[:R], ix.gate, b.igr[:R])
         sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
     if sparse_rows and host_pos >= c.dense_limit:     # every row sparse: the dense pass is skipped
         o = torch.empty((R, HL, c.v_dim), dtype=torch.bfloat16, device=b.q.device) if b.prefill else b.attn.out[:R]
@@ -360,7 +379,10 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         ix = a.index
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
-            glue.router(b.normed[:R], ix.gate, b.igr[:R])
+            if w.meta.get("packed_exl3"):
+                mm(b, b.normed[:R], packed.PlainLinear(ix.gate), None, b.igr[:R], f32=True)
+            else:
+                glue.router(b.normed[:R], ix.gate, b.igr[:R])
             sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
     with prof.timed("dsa: absorb"):
         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
@@ -393,13 +415,19 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     c = w.cfg
     m = layer.moe
     with prof.timed("moe: route"):
-        glue.router(b.normed[:R], m.router, b.mlog[:R])
+        if w.meta.get("packed_exl3"):
+            mm(b, b.normed[:R], packed.PlainLinear(m.router), None, b.mlog[:R], f32=True)
+        else:
+            glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+        if w.meta.get("packed_exl3"):
+            routed_micro_windows(b.normed[:R], b.pick[:R], m.experts, b.exl3, b.ey[:R], R, c.limit)
+        else:
+            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
         s = m.shared
         mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
@@ -433,13 +461,13 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
             g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
                           st.index[di] if st.index is not None else None, host_pos, sparse_np)
     with prof.timed("hc"):
-        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+        glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
-    glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+    glue.hc_post(x, x, g, b.post[:R], b.comb[:R], fp32_residual=b.fp32_residual)
 
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:

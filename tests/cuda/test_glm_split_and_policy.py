@@ -197,13 +197,18 @@ def test_policies_and_the_request_header():
         assert (parts[2] << 62) | (parts[1] << 31) | parts[0] == seed
 
 
-def test_family_has_a_mac_engine_and_cuda_needs_two_ranks(tmp_path):
+def test_family_has_a_mac_engine_and_cuda_supports_singleton(tmp_path, monkeypatch):
     from tensorfold.families import glm5_next
+    from tensorfold.families.glm5_next.cuda import engine
 
     assert glm5_next.MODEL_TYPES == ("glm5_next",) and callable(glm5_next.load)
     assert glm5_next.CUDA_APP.__name__ == "GlmApp"
-    with pytest.raises(ValueError, match="two GPUs"):
-        glm5_next.cuda_engine(tmp_path, tp=1)
+    monkeypatch.setattr(engine, "GlmEngine", lambda path, **kwargs: kwargs)
+    settings = glm5_next.cuda_engine(tmp_path, tp=1, target_only=True, eager=True)
+    assert settings["world"] == 1 and settings["rank"] == 0
+    assert settings["serial_only"] and settings["target_only"] and settings["eager"]
+    with pytest.raises(ValueError, match="rank"):
+        glm5_next.cuda_engine(tmp_path, tp=1, rank=1)
     with pytest.raises(ValueError, match="--master"):
         glm5_next.cuda_engine(tmp_path, tp=2, rank=0, master="")
 
@@ -269,7 +274,7 @@ def test_requests_past_the_context_get_a_400_before_streaming(tmp_path):
                     conn.close()
 
 
-def test_check_accepts_mlx_4bit_and_mias_exl3_only(tmp_path):
+def test_check_accepts_mlx_legacy_mcg_and_exact_packed_mul1(tmp_path):
     from tensorfold.families import glm5_next
 
     assert glm5_next.QUANT_METHODS == {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
@@ -278,6 +283,10 @@ def test_check_accepts_mlx_4bit_and_mias_exl3_only(tmp_path):
         "mlx8": ({"quantization": {"bits": 8, "group_size": 64}}, False),
         "exl3": ({"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "mcg",
                                           "scope": "glm53_routed_experts_only"}}, True),
+        "packed-mul1": ({"quantization_config": {"quant_method": "exl3", "bits": 2.05, "head_bits": 5,
+                                                 "codebook": "mul1", "out_scales": "always"}}, True),
+        "packed-bad-head": ({"quantization_config": {"quant_method": "exl3", "bits": 2.05, "head_bits": 4,
+                                                    "codebook": "mul1", "out_scales": "always"}}, False),
         "exl3-3bit": ({"quantization_config": {"quant_method": "exl3", "bits": 3, "codebook": "mcg",
                                                "scope": "glm53_routed_experts_only"}}, False),
         "exl3-all": ({"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "3inst",

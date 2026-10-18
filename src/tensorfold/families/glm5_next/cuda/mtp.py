@@ -14,7 +14,11 @@ from .weights import Weights
 def mtp_stage(w: Weights, st: State, b: Buffers, next_tokens: Sequence[int], hidden: torch.Tensor) -> int:
     """Host work before an MTP step: the next tokens and the input hidden rows into the static buffers."""
 
+    if w.mtp is None or b is None:
+        raise ValueError("MTP weights/work were explicitly omitted")
     n = len(next_tokens)
+    if not 1 <= n <= b.rows:
+        raise ValueError("MTP row count exceeds static buffers")
     b.zero_first = st.mtp_len == 0
     check_room(w, st, n, pos=st.mtp_len)
     b.staged.synchronize()
@@ -32,6 +36,8 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
 
     c = w.cfg
     m = w.mtp
+    if m is None:
+        raise ValueError("MTP weights/work were explicitly omitted")
     D = c.hidden
     glue.embed(b.ids[:n], w.embed, D, 1, b.me[:n])
     if b.zero_first:
