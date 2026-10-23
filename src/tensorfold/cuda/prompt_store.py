@@ -203,6 +203,8 @@ class Store:
         self.jlock = threading.Lock()
         self.jpath = self.root / self.key / "journal.log"
         self._recover(torn)
+        self.room = {0: 0, 1: 0}                          # patch 0011: bytes each pool had left at the last eviction
+        self.grown = 0                                    # bytes written since (an eviction scan runs once past it)
         atexit.register(self.close)
         _log(f"{self.root} key {self.key} ({key}): {len(self.points)} points, {len(self.blocks)} blocks; normal "
              f"{self.normal_cap / GIB:g} GiB for {self.ttl / 3600:g} h, pinned {self.pinned_cap / GIB:g} GiB after "
@@ -342,7 +344,9 @@ class Store:
                     self._journal(None, unless_busy=True)     # nothing in flight: start the journal again
                 elif op is not None and op[0] == "used":
                     self._use(db, *op[1:])
-                if time.time() - last > 60 or (op is not None and op[0] == "put"):
+                # patch 0011: a scan after a put only once the bytes written since the last one may pass a cap
+                if time.time() - last > 60 or (op is not None and op[0] == "put" and
+                                               self.grown >= min(self.room.values())):
                     self._evict(db)
                     if time.time() - last > 600:
                         self._report()
@@ -381,6 +385,7 @@ class Store:
                 self._lengths()
             self.stats["saved"] += 1
             self.stats["saved_bytes"] += size + sum(sizes[h] for h in blocks)
+            self.grown += size + sum(sizes[h] for h in blocks)
         finally:
             with self.lock:
                 self.inflight.pop(k, None)
@@ -401,6 +406,7 @@ class Store:
         db.execute("UPDATE points SET used=?, hits=hits+1, conts=?, next=COALESCE(next, ?), pinned=? "
                    "WHERE model=? AND key=?", (time.time(), json.dumps(conts), nxt, pin, self.key, k))
         if pin and not row[1]:
+            self.room[1] = min(self.room[1], 0)           # the pinned pool grew: scanned at the next put
             self.stats["pinned"] += 1
             _log(f"pinned a point ({len(conts)} different continuations resumed from it)")
 
@@ -431,26 +437,39 @@ class Store:
             self.tier.evict(f"{model}/b/{h}.pt")
         self.stats["evicted"] += len(rows)
 
+    def _pools(self, db) -> dict[int, int]:
+        """Bytes of each pool (every model's): its points, and the blocks a pinned point uses (pinned) or not (normal).
+        Patch 0011: the held blocks once, by a join (a correlated EXISTS scanned every use per block: ~1 s a call on
+        a full index, twice a pool after every put, so the writer fell behind a long prefill's points)."""
+
+        normal, pinned, total, held = db.execute(
+            "SELECT (SELECT COALESCE(SUM(bytes),0) FROM points WHERE pinned=0), "
+            "(SELECT COALESCE(SUM(bytes),0) FROM points WHERE pinned=1), (SELECT COALESCE(SUM(bytes),0) FROM blocks), "
+            "(SELECT COALESCE(SUM(b.bytes),0) FROM blocks b JOIN (SELECT DISTINCT u.model, u.block FROM points p "
+            "JOIN uses u ON u.model=p.model AND u.point=p.key WHERE p.pinned=1) x "
+            "ON x.model=b.model AND x.block=b.hash)").fetchone()
+        return {0: normal + total - held, 1: pinned + held}
+
     def _pool(self, db, pinned: int) -> int:
-        pts = db.execute("SELECT COALESCE(SUM(bytes),0) FROM points WHERE pinned=?", (pinned,)).fetchone()[0]
-        held = ("EXISTS" if pinned else "NOT EXISTS") + (
-            " (SELECT 1 FROM uses u JOIN points p ON p.model=u.model AND p.key=u.point "
-            "WHERE u.model=b.model AND u.block=b.hash AND p.pinned=1)")
-        blk = db.execute(f"SELECT COALESCE(SUM(bytes),0) FROM blocks b WHERE {held}").fetchone()[0]
-        return pts + blk
+        return self._pools(db)[pinned]
 
     def _evict(self, db) -> None:
         old = db.execute("SELECT model, key FROM points WHERE pinned=0 AND created<?",
                          (time.time() - self.ttl,)).fetchall()
         if old:
             self._drop(db, old)
-        for pinned, cap in ((0, self.normal_cap), (1, self.pinned_cap)):
-            while self._pool(db, pinned) > cap:
+        self.grown = 0
+        caps = {0: self.normal_cap, 1: self.pinned_cap}
+        pools = self._pools(db)
+        for pinned, cap in caps.items():
+            while pools[pinned] > cap:
                 rows = db.execute("SELECT model, key FROM points WHERE pinned=? ORDER BY used LIMIT 8",
                                   (pinned,)).fetchall()
                 if not rows:
                     break
                 self._drop(db, rows)
+                pools = self._pools(db)
+        self.room = {p: caps[p] - pools[p] for p in caps}
 
     def _report(self) -> None:
         s = self.stats

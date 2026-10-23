@@ -332,3 +332,64 @@ def test_gpu_points_keep_shared_starts(monkeypatch):
     kept = [k[0] for k in owner.kept]
     assert sys_ in kept and len(kept) == 3
     assert [k[1] for k in owner.kept][1:] == slots[4:]                      # the newest ends stay
+
+
+def _old_pool(db, pinned):
+    """The pools as patch 0006 summed them (a correlated EXISTS per block): what ``_pools`` must equal."""
+    pts = db.execute("SELECT COALESCE(SUM(bytes),0) FROM points WHERE pinned=?", (pinned,)).fetchone()[0]
+    held = ("EXISTS" if pinned else "NOT EXISTS") + (
+        " (SELECT 1 FROM uses u JOIN points p ON p.model=u.model AND p.key=u.point "
+        "WHERE u.model=b.model AND u.block=b.hash AND p.pinned=1)")
+    return pts + db.execute(f"SELECT COALESCE(SUM(bytes),0) FROM blocks b WHERE {held}").fetchone()[0]
+
+
+def test_pools_equal_the_old_sums_and_are_quick(env):
+    """Patch 0011: ``_pools`` by one join equals the old correlated sums (two models in one index, blocks shared by
+    pinned and normal points, uses of a block one model has not), on an index the size of a full one."""
+    w = _weights()
+    s = _Dec(w, "bf16").store
+    db = s._db()
+    rng = np.random.default_rng(0)
+    db.execute("BEGIN")
+    for model in ("m1", "m2"):
+        blocks = [f"b{j}" for j in range(300)]
+        db.executemany("INSERT INTO blocks VALUES (?,?,?)", [(model, h, int(rng.integers(1, 1 << 30))) for h in blocks])
+        for i in range(350):
+            db.execute("INSERT INTO points(model,key,n,bytes,total,created,used,pinned) VALUES (?,?,?,?,?,?,?,?)",
+                       (model, f"p{i}", i, int(rng.integers(1, 1 << 26)), 0, 0, i, int(i % 40 == 0)))
+            start = int(rng.integers(0, 250))
+            uses = [(model, f"p{i}", f"b{j}") for j in range(start, start + int(rng.integers(1, 50)))]
+            db.executemany("INSERT OR IGNORE INTO uses VALUES (?,?,?)", uses + [(model, f"p{i}", "gone")])
+    db.execute("COMMIT")
+    t0 = time.perf_counter()
+    old = {p: _old_pool(db, p) for p in (0, 1)}
+    t1 = time.perf_counter()
+    new = s._pools(db)
+    t2 = time.perf_counter()
+    assert new == old and old[1] > 0
+    assert t2 - t1 < max(0.2, (t1 - t0) / 2)
+
+
+def test_puts_scan_the_pools_only_near_a_cap(env, monkeypatch):
+    """Patch 0011: a put runs the eviction scan once the bytes written since the last one may pass a cap, not after
+    every put; the caps still hold."""
+    w = _weights()
+    a = _Dec(w, "bf16")
+    s = a.store
+    calls = []
+    real = s._pools
+    monkeypatch.setattr(s, "_pools", lambda db: calls.append(1) or real(db))
+    st = a.free[0]
+    _fill(st, 6000, 7)
+    ids = list(range(6000))
+    for n in (1100, 2200, 3300, 4400):
+        a._remember(ids[:n], st, {**st.snapshot(), "pos": n, "mtp_len": n - 1}, None)
+    _drain(s)
+    time.sleep(0.2)
+    assert len(s.points) == 4 and len(calls) == 1                  # the first put (nothing measured yet) only
+    s.room = {0: 1, 1: 1}                                           # the pools all but full: the next put scans
+    s.normal_cap = 1
+    a._remember(ids[:5500], st, {**st.snapshot(), "pos": 5500, "mtp_len": 5499}, None)
+    _drain(s)
+    time.sleep(0.3)
+    assert len(calls) >= 2 and not s.points                         # over the cap: evicted
