@@ -28,6 +28,10 @@ STEP = int(os.environ.get("TF_PREFILL_STEP", "1024"))   # prompt rows a prefill 
 DEFER = os.environ.get("TF_QWEN36_GDN_DEFER", "1") != "0"
 
 
+# patch 0011: the most a prefill step's points hold before the first token (TF_PROMPT_CACHE_DEFER_GIB with the store)
+LATER_CAP = int(float(os.environ.get("TF_PROMPT_CACHE_DEFER_GIB", "") or 2.0) * 1024**3)
+
+
 class KeptEnds(PrefixCache):
     """``PrefixCache`` whose cap drops by ``keep_rank`` (patch 0010; 0103 before): a state inside a conversation's
     history first (a newer state of it extends it; it is on disk), then a conversation's newest state, then a shared
@@ -182,8 +186,14 @@ class MultiDecoder:
 
         s.later = []
 
+        cap = self.store.defer_cap if self.store is not None else LATER_CAP
+
         def keep(point, state, cache, held):     # added (and queued for the disk) once the step has sampled
             s.later.append((list(s.prompt[:point]), kept(state), (cache.view(), held.clone())))
+            # patch 0011: a long prompt's points in one step hold a DeltaNet copy each: past the cap the oldest are
+            # added (and queued) now, so a step's points never hold more than that
+            while len(s.later) > 1 and sum(disk_points.held_bytes(x[1], x[2]) for x in s.later) > cap:
+                self._add(*s.later.pop(0))
 
         try:
             normed, held = extend(self.w, self.head if d is not None else None, s.prompt, s.st,

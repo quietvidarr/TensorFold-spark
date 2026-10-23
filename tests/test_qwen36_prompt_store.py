@@ -169,6 +169,35 @@ def test_waiting_states_stay_within_their_cap(env, monkeypatch):
     assert not a.unsaved and not s.defer_bytes and len(s.points) == 6 and s.stats["lost"] == 0
 
 
+def test_a_steps_points_stay_within_the_cap(monkeypatch):
+    """Patch 0011: a long prompt's points inside one prefill step (each a DeltaNet copy) are kept as they come once
+    past the cap, not all held until the step's first token."""
+    from tensorfold.families.qwen3_5_moe.cuda import multi
+
+    w = _weights()
+    dec = object.__new__(multi.MultiDecoder)
+    dec.w, dec.head, dec.store, dec.cache, dec.unsaved = w, None, None, KeptEnds(3), []
+    state, (mc, held) = _state(w, 6000, 3)
+    one = disk_points.held_bytes(state, (mc, held))
+    monkeypatch.setattr(multi, "LATER_CAP", int(one * 2.5))
+    state.pos = 0                                                      # the step prefills from the start
+    peak = []
+
+    def extend(w_, head, prompt, st, cache, carry, stop, *, keep_at, keep, points):
+        for p in points:
+            st.pos = p
+            keep(p, st, mc, held)
+            peak.append(len(s.later))
+        return None, held
+
+    monkeypatch.setattr(multi, "extend", extend)
+    s = SimpleNamespace(prompt=list(range(6000)), st=state, snap=None, stops=list(range(300, 5900, 300)), prefill_s=0)
+    assert dec._step(s, 5950) is None
+    assert max(peak) <= 2 and len(dec.cache.entries) == 3              # the oldest went to the kept ends at once
+    dec._flush_points(s)
+    assert dec.cache.entries[-1][0] == s.prompt[:s.stops[-1]]
+
+
 def test_kept_ends_keep_shared_starts():
     """Over the cap: history states first, then conversations' newest; a reused system prompt's state stays."""
     import numpy as np
