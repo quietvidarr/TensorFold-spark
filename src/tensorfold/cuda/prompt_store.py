@@ -164,6 +164,12 @@ class Store:
         self.pin_after = int(_env("TF_PROMPT_CACHE_PIN_AFTER", 3, int))
         # host memory the copies waiting for the writer may hold; past it a point waits in its GPU slot (patch 0010)
         self.queue_cap = int(_env("TF_PROMPT_CACHE_QUEUE_GIB", 4.0) * GIB)
+        # patch 0011: GPU memory the points waiting in their slots may hold (their snapshots); past it, or past the
+        # memory gate, the engine waits for the writer (``wait``) instead of keeping one more. Never drops a point.
+        self.defer_cap = int(_env("TF_PROMPT_CACHE_DEFER_GIB", 2.0) * GIB)
+        self.wait_s = _env("TF_PROMPT_CACHE_WAIT_S", 120.0)              # the longest a wait blocks; then past the cap
+        self.gate = None                                                  # the engine's MemoryGate (or the host's)
+        self.waiters = 0                                                  # engine threads in ``wait``: no pacing
         self.exit_s = _env("TF_PROMPT_CACHE_EXIT_S", 20.0)              # how long a stopping server waits for the writer
         self.prefill_tps = _env("TF_PROMPT_CACHE_PREFILL_TPS", 1800.0)    # tokens a second a load saves recomputing
         self.read_bps = _env("TF_PROMPT_CACHE_READ_GBS", 2.0) * 1e9        # measured from the loads as they happen
@@ -176,12 +182,14 @@ class Store:
         self.repin: dict[str, tuple[str, str]] = {}       # ids hash -> (model, key) of an old key's pinned point
         self.queued = 0
         self.deferred: dict[str, int] = {}               # points waiting in their GPU slot for room in the queue
+        self.defer_bytes: dict[str, int] = {}            # patch 0011: the GPU bytes each of them holds
         self.inflight: dict[str, int] = {}               # points queued for the writer, not yet written
         # patch 0010: no point is dropped. deferred: waited in GPU memory for the queue; forced: copied past the queue's
         # cap because its slot was needed; lost: could not be saved (a write failed, or the server stopped before the
         # writer got to it); lost_before: queued by the previous run of this key and never written (killed, power)
         self.stats = dict(saved=0, saved_bytes=0, dropped=0, loads=0, load_tokens=0, load_s=0.0, evicted=0,
-                          pinned=0, errors=0, deferred=0, forced=0, lost=0, lost_before=0, queue_peak=0)
+                          pinned=0, errors=0, deferred=0, forced=0, lost=0, lost_before=0, queue_peak=0,
+                          waits=0, wait_s=0.0, defer_peak=0)
         self.q: queue.Queue = queue.Queue()
         self.copier = Copier()
         self.idle = idle
@@ -203,13 +211,16 @@ class Store:
         self.jlock = threading.Lock()
         self.jpath = self.root / self.key / "journal.log"
         self._recover(torn)
+        self.gate = _host_gate()
         self.room = {0: 0, 1: 0}                          # patch 0011: bytes each pool had left at the last eviction
         self.grown = 0                                    # bytes written since (an eviction scan runs once past it)
+        self.unpinned = 0                                 # pinned host bytes freed since torch's cache was emptied
         atexit.register(self.close)
         _log(f"{self.root} key {self.key} ({key}): {len(self.points)} points, {len(self.blocks)} blocks; normal "
              f"{self.normal_cap / GIB:g} GiB for {self.ttl / 3600:g} h, pinned {self.pinned_cap / GIB:g} GiB after "
              f"{self.pin_after} continuations; {len(self.repin)} pinned points of an older key to prefill again")
-        threading.Thread(target=self._writer, daemon=True, name="prompt-cache-writer").start()
+        self.thread = threading.Thread(target=self._writer, daemon=True, name="prompt-cache-writer")
+        self.thread.start()
         if self.repin and idle is not None:
             threading.Thread(target=self._rebuild, daemon=True, name="prompt-cache-rebuild").start()
 
@@ -248,11 +259,60 @@ class Store:
 
         return self.queued >= self.queue_cap
 
-    def defer(self, k: str, n: int) -> None:
+    def outside(self) -> int:
+        """Patch 0011: memory the store holds that no cache budget counts (``MemoryGate.outside``): the points
+        waiting in GPU slots and the host copies past the queue's cap."""
+
+        return sum(dict(self.defer_bytes).values()) + max(0, self.queued - self.queue_cap)
+
+    def may_defer(self, k: str, nbytes: int) -> bool:
+        """Patch 0011: whether a point may wait in its slot holding ``nbytes`` more: under ``defer_cap`` and the gate
+        (else the caller ``wait``s for the writer and queues it)."""
+
+        extra = max(0, int(nbytes) - self.defer_bytes.get(k, 0))
+        if sum(self.defer_bytes.values()) + extra > self.defer_cap:
+            return False
+        return self.gate is None or self.gate.fits(extra)
+
+    def may_force(self, nbytes: int) -> bool:
+        """Patch 0011: whether a copy may go past the queue's cap now (its slot is needed): the bytes past the cap
+        stay within ``defer_cap`` and the gate; else the caller ``wait``s first."""
+
+        if not self.full():
+            return True
+        if max(0, self.queued - self.queue_cap) + int(nbytes) > self.defer_cap:
+            return False
+        return self.gate is None or self.gate.fits(int(nbytes))
+
+    def wait(self) -> float:
+        """Patch 0011 backpressure: block the engine until the writer has room in the queue (it does not pace
+        meanwhile), at most ``wait_s``; then the caller copies past the cap (counted ``forced``): never dropped."""
+
+        t0 = time.monotonic()
+        self.waiters += 1
+        try:
+            while self.full() and self.thread.is_alive() and time.monotonic() - t0 < self.wait_s:
+                time.sleep(0.002)
+        finally:
+            self.waiters -= 1
+        s = time.monotonic() - t0
+        self.stats["waits"] += 1
+        self.stats["wait_s"] += s
+        return s
+
+    def defer(self, k: str, n: int, nbytes: int = 0) -> None:
         if k not in self.deferred:
             self.deferred[k] = n
             self.stats["deferred"] += 1
             self._journal(f"q {k} {n}")
+        self.defer_bytes[k] = int(nbytes)
+        self.stats["defer_peak"] = max(self.stats["defer_peak"], sum(self.defer_bytes.values()))
+
+    def undefer(self, k: str) -> None:
+        """A waiting point left its slot's list: queued (``put``), already there, or not savable any more."""
+
+        self.deferred.pop(k, None)
+        self.defer_bytes.pop(k, None)
 
     def put(self, k: str, n: int, ids, point: dict, blocks: dict, order: list[str], nbytes: int, ready=None,
             forced: bool = False) -> bool:
@@ -267,6 +327,7 @@ class Store:
             self.held.update(order)
             self.inflight[k] = n
         self.stats["forced"] += int(forced)
+        self.defer_bytes.pop(k, None)
         if self.deferred.pop(k, None) is None:
             self._journal(f"q {k} {n}")
         self.q.put(("put", k, n, ids_hash(ids), point, blocks, order, nbytes, ready))
@@ -309,7 +370,7 @@ class Store:
         if self.idle is None or PACE_S <= 0:
             return
         t0 = time.monotonic()
-        while (not self.idle() and self.queued <= max(self.queue_cap, nbytes)
+        while (not self.idle() and self.queued < max(self.queue_cap, nbytes + 1) and not self.waiters
                and time.monotonic() - t0 < PACE_S):   # (a point bigger than the cap: alone in the queue)
             time.sleep(0.05)
 
@@ -332,9 +393,14 @@ class Store:
                             op[-1].synchronize()              # the host copies have landed (``Copier``)
                         self._write(db, *op[1:-1])
                         self._journal(f"w {op[1]}")
-                        if self.queued <= 0 and RELEASE_PINNED:   # drained: the pinned copies' memory back to the
-                            op = ("put",)                         # system (torch keeps freed pinned blocks cached;
-                            torch._C._host_emptyCache()           # on unified memory that is GPU memory too)
+                        self.unpinned += op[7]
+                        # drained, or a queue's worth freed while it never drains (a long prefill's points; patch
+                        # 0011): the pinned copies' memory back to the system (torch keeps freed pinned blocks
+                        # cached; on unified memory that is GPU memory too)
+                        if RELEASE_PINNED and (self.queued <= 0 or self.unpinned >= self.queue_cap):
+                            op = ("put",)
+                            self.unpinned = 0
+                            torch._C._host_emptyCache()
                     except Exception as exc:  # noqa: BLE001
                         self.stats["lost"] += 1
                         self._journal(f"x {op[1]}")
@@ -475,7 +541,8 @@ class Store:
         s = self.stats
         _log(f"{len(self.points)} points; saved {s['saved']} ({s['saved_bytes'] / GIB:.1f} GiB), loaded {s['loads']} "
              f"({s['load_tokens']} tokens, {s['load_s']:.1f} s), evicted {s['evicted']}, pinned {s['pinned']}, "
-             f"errors {s['errors']}; waited in GPU {s['deferred']}, forced {s['forced']}, queue peak "
+             f"errors {s['errors']}; waited in GPU {s['deferred']} (peak {s['defer_peak'] / GIB:.2f} GiB), forced "
+             f"{s['forced']}, engine waited {s['waits']} ({s['wait_s']:.1f} s), queue peak "
              f"{s['queue_peak'] / GIB:.2f} GiB, LOST {s['lost']} (previous run {s['lost_before']})")
         try:
             tmp = self.root / self.key / "stats.json.tmp"
@@ -563,6 +630,18 @@ class Store:
                                        timeout=3600).read()
             except Exception as exc:  # noqa: BLE001
                 _log(f"prefilling a pinned point again failed: {type(exc).__name__}: {exc}")
+
+
+def _host_gate():
+    """Patch 0011: a gate on live memory for a store whose engine has none (``Store.gate``; an engine with its own
+    MemoryGate replaces it): the driver's free memory, MemAvailable on a unified GPU, less TF_PROMPT_CACHE_RESERVE_GIB."""
+
+    if not torch.cuda.is_available():
+        return None
+    from .capacity import available_bytes
+    from .memory_gate import MemoryGate, torch_live
+
+    return MemoryGate(1 << 62, int(_env("TF_PROMPT_CACHE_RESERVE_GIB", 2.0) * GIB), torch_live(torch, available_bytes))
 
 
 def open_store(geometry: str, *, idle=None) -> Store | None:

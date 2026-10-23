@@ -121,6 +121,31 @@ def test_full_queue_waits_then_copies(env, monkeypatch):
     _wait(eng.store, eng.store.prefix(ids).point(1200))
 
 
+def test_waiting_snapshots_stay_within_their_cap(env, monkeypatch):
+    """Patch 0011: with a slow writer the snapshots waiting in GPU memory stay within TF_PROMPT_CACHE_DEFER_GIB;
+    past it the engine waits for the writer. Every snapshot is saved."""
+    from tensorfold.families.glm5_next.cuda.decode import snapshot_bytes
+
+    monkeypatch.setenv("TF_PROMPT_CACHE_QUEUE_GIB", "1e-9")
+    st = _state()
+    eng = _Eng(st)
+    s = eng.store
+    put = s.tier.put
+    monkeypatch.setattr(s.tier, "put", lambda rel, obj: time.sleep(0.03) or put(rel, obj))
+    ids = list(range(5000, 5000 + 4000))
+    eng.live = list(ids)
+    snaps = [_snap(st, ids[:n]) for n in range(600, 4000, 500)]
+    s.defer_cap = int(snapshot_bytes(snaps[0]) * 1.5)                 # room for one
+    for d in snaps:
+        assert disk_points.capture(eng, d)
+        assert sum(s.defer_bytes.values()) <= s.defer_cap and len(eng.unsaved) <= 1 and len(s.inflight) <= 1
+    assert s.stats["waits"] > 0
+    disk_points.retry(eng, force=True)
+    for d in snaps:
+        _wait(s, s.prefix(d.ids).point(len(d.ids)))
+    assert not eng.unsaved and not s.defer_bytes and s.stats["lost"] == 0
+
+
 def test_layout_mismatch_is_refused(env):
     eng = _Eng(_state())
     ids = list(range(300, 1300))

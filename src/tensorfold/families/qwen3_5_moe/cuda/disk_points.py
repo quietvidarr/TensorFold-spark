@@ -44,6 +44,13 @@ def _bytes(obj) -> int:
     return 0
 
 
+def held_bytes(state, snap) -> int:
+    """What a kept entry holds of its own (patch 0011): its DeltaNet states' copies and the held rows (its attention
+    rows are views of its stream's caches)."""
+
+    return _bytes(state.rec) + _bytes(state.conv) + _bytes(snap[1])
+
+
 def geometry(w) -> str:
     """What the saved rows' layout depends on, beyond the model key: a different one never reads them."""
 
@@ -63,7 +70,9 @@ def open_store(dec):
 def capture(dec, ids: list[int], state, snap, *, force: bool = False) -> None:
     """Queue a kept entry for the store (its new blocks and the rows past them), unless it is there already. While the
     queue is full (patch 0107) the entry waits in GPU memory (``dec.unsaved``; its rows are views commits never write
-    and its recurrent states are copies, so holding it keeps it intact) until ``retry`` finds room."""
+    and its recurrent states are copies, so holding it keeps it intact) until ``retry`` finds room. Patch 0011: the
+    states waiting stay within TF_PROMPT_CACHE_DEFER_GIB and the host's memory; past them the caller waits for the
+    writer."""
 
     store = dec.store
     n = len(ids)
@@ -74,11 +83,18 @@ def capture(dec, ids: list[int], state, snap, *, force: bool = False) -> None:
     k = pre.point(n)
     if store.has_point(k):
         return
-    if not force and store.full():
-        if all(u[0] != k for u in dec.unsaved):
-            dec.unsaved.append((k, list(ids), state, snap))
-            store.defer(k, n)
-        return
+    if store.full():
+        nb = held_bytes(state, snap)
+        if force:
+            if not store.may_force(nb):
+                store.wait()                   # patch 0011: the copy past the cap would not fit: the writer first
+        elif store.may_defer(k, nb):
+            if all(u[0] != k for u in dec.unsaved):
+                dec.unsaved.append((k, list(ids), state, snap))
+            store.defer(k, n, nb)
+            return
+        else:
+            store.wait()                       # patch 0011: no room to keep one more: the step waits for the writer
     cp = store.copier
     full = min((n - 1) // B, mc.pos // B)
     order = [pre.block(j) for j in range(full)]
@@ -89,7 +105,7 @@ def capture(dec, ids: list[int], state, snap, *, force: bool = False) -> None:
              "rec": [cp.host(r) for r in state.rec if r is not None],
              "conv": [cp.host(c) for c in state.conv if c is not None], "held": cp.host(held)}
     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),
-              ready=cp.done(), forced=force and store.full())
+              ready=cp.done(), forced=store.full())
 
 
 def retry(dec, *, force: bool = False) -> None:
@@ -105,7 +121,7 @@ def retry(dec, *, force: bool = False) -> None:
             dec.store.stats["errors"] += 1
             print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
         if all(x[0] != u[0] for x in dec.unsaved):
-            dec.store.deferred.pop(u[0], None)
+            dec.store.undefer(u[0])
 
 
 def restore(dec, prompt: list[int]) -> None:

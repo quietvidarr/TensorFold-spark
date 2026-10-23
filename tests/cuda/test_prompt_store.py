@@ -393,3 +393,51 @@ def test_puts_scan_the_pools_only_near_a_cap(env, monkeypatch):
     _drain(s)
     time.sleep(0.3)
     assert len(calls) >= 2 and not s.points                         # over the cap: evicted
+
+
+def test_deferred_points_stay_within_their_cap(env, monkeypatch):
+    """Patch 0011: a slow writer and a long prompt's points (the queue always full) never hold more snapshots in
+    GPU slots than TF_PROMPT_CACHE_DEFER_GIB: past it the pass waits for the writer. No point is dropped."""
+    monkeypatch.setenv("TF_PROMPT_CACHE_QUEUE_GIB", "1e-9")
+    w = _weights()
+    a = _Dec(w, "bf16")
+    s = a.store
+    put = s.tier.put
+    monkeypatch.setattr(s.tier, "put", lambda rel, obj: time.sleep(0.03) or put(rel, obj))
+    st = a.free[0]
+    _fill(st, 9000, 8)
+    ids = list(range(9000))
+    snaps = [(n, {**st.snapshot(), "pos": n, "mtp_len": n - 1}) for n in range(1100, 9000, 700)]
+    s.defer_cap = int(disk_points._bytes(snaps[0][1]) * 1.5)       # room for one waiting snapshot
+    for n, snap in snaps:
+        disk_points.capture(a, ids[:n], st, snap, None)
+        assert sum(s.defer_bytes.values()) <= s.defer_cap and len(a.unsaved) <= 1
+        assert len(s.inflight) <= 1                                 # the queue: one point past its cap at most
+    assert s.stats["waits"] > 0 and s.stats["deferred"] >= 1
+    disk_points.retry(a, force=True)                               # idle: the waiting one too
+    _drain(s)
+    assert not a.unsaved and not s.deferred and not s.defer_bytes
+    assert len(s.points) == len(snaps) and s.stats["lost"] == 0 and s.stats["dropped"] == 0
+
+
+def test_store_bytes_count_in_the_memory_gate(env):
+    """Patch 0011: what the store holds outside the caches (waiting snapshots, copies past the queue's cap) counts
+    in the engine's MemoryGate, and a point does not wait in its slot when the gate has no room for it."""
+    from tensorfold.cuda.memory_gate import MemoryGate
+
+    w = _weights()
+    a = _Dec(w, "bf16")
+    gate = MemoryGate(1000, 100)
+    a.memory_gate = gate
+    s = disk_points.open_store(a)
+    assert s.gate is gate and gate.outside == [s.outside]
+    assert gate.fits(900)
+    s.defer("k", 10, 300)
+    assert not gate.fits(900) and gate.fits(600)
+    s.queued = s.queue_cap + 200                                   # forced copies past the cap
+    assert not gate.fits(600) and gate.fits(400)
+    assert not s.may_defer("k2", 500) and s.may_defer("k2", 100)
+    assert not s.may_force(500) and s.may_force(100)
+    s.queued = 0
+    s.undefer("k")
+    assert gate.fits(900)

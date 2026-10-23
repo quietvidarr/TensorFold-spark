@@ -71,13 +71,19 @@ def open_store(dec):
     if B % st.ratio:
         print(f"[prompt-cache] off: attention pools of {st.ratio} rows don't divide {B}-row blocks", flush=True)
         return None
-    return ps.open_store(geometry(st), idle=lambda: not dec.streams and not dec.filling)
+    store = ps.open_store(geometry(st), idle=lambda: not dec.streams and not dec.filling)
+    gate = getattr(dec, "memory_gate", None)
+    if store is not None and gate is not None:     # patch 0011: the store's held bytes count in the engine's gate
+        store.gate = gate
+        gate.outside.append(store.outside)
+    return store
 
 
 def capture(dec, ids: list[int], st, snap: dict, tail, *, force: bool = False) -> None:
     """Queue a kept point for the store (its new blocks and the rows past them), unless it is there already. While the
     queue is full (patch 0010) the point waits in its GPU slot (``dec.unsaved``) instead: ``retry`` copies it when the
-    queue has room, ``flush`` at once when its slot is about to be reused (``force``)."""
+    queue has room, ``flush`` at once when its slot is about to be reused (``force``). Patch 0011: the snapshots
+    waiting stay within TF_PROMPT_CACHE_DEFER_GIB and the memory gate; past them the pass waits for the writer."""
 
     store = dec.store
     n = len(ids)
@@ -87,11 +93,18 @@ def capture(dec, ids: list[int], st, snap: dict, tail, *, force: bool = False) -
     k = pre.point(n)
     if store.has_point(k):
         return
-    if not force and store.full():
-        if all(u[0] != k for u in dec.unsaved):
-            dec.unsaved.append((k, list(ids), st, snap, tail))
-            store.defer(k, n)
-        return
+    if store.full():
+        held = _bytes(snap) + _bytes(tail)
+        if force:
+            if not store.may_force(held):
+                store.wait()                   # patch 0011: the copy past the cap would not fit: the writer first
+        elif store.may_defer(k, held):
+            if all(u[0] != k for u in dec.unsaved):
+                dec.unsaved.append((k, list(ids), st, snap, tail))
+            store.defer(k, n, held)
+            return
+        else:
+            store.wait()                       # patch 0011: no room to keep one more: the pass waits for the writer
     main, mtp = _caches(st)
     cp = store.copier
     m = int(snap["mtp_len"]) if mtp else n
@@ -110,7 +123,7 @@ def capture(dec, ids: list[int], st, snap: dict, tail, *, force: bool = False) -
     if tail is not None:
         point["tail"] = cp.host(tail)
     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),
-              ready=cp.done(), forced=force and store.full())
+              ready=cp.done(), forced=store.full())
 
 
 def _save(dec, u, force: bool) -> None:
@@ -121,7 +134,7 @@ def _save(dec, u, force: bool) -> None:
         dec.store.stats["errors"] += 1
         print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
     if all(x[0] != u[0] for x in dec.unsaved):
-        dec.store.deferred.pop(u[0], None)
+        dec.store.undefer(u[0])
 
 
 def retry(dec, *, force: bool = False) -> None:

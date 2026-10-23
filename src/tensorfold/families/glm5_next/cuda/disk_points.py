@@ -66,7 +66,9 @@ def _full(n: int, m: int) -> int:
 def capture(engine, snap, *, force: bool = False) -> bool:
     """Queue a kept snapshot for the store (its new blocks and the rows past them), unless it is there already. Its
     rows are read from the live caches (they must still hold its prefix) or from its saved rows. While the queue is
-    full the snapshot waits in GPU memory (``engine.unsaved``) until ``retry`` finds room. True when queued or there."""
+    full the snapshot waits in GPU memory (``engine.unsaved``) until ``retry`` finds room. Patch 0011: the snapshots
+    waiting stay within TF_PROMPT_CACHE_DEFER_GIB and the host's memory; past them the engine waits for the writer.
+    True when queued or there."""
 
     store = engine.store
     ids = snap.ids
@@ -77,11 +79,20 @@ def capture(engine, snap, *, force: bool = False) -> bool:
         return True
     if snap.rows is None and engine.live[:n] != ids:
         return False                                   # its rows are gone (not ours to save any more)
-    if not force and store.full():
-        if all(u is not snap for u in engine.unsaved):
-            engine.unsaved.append(snap)
-            store.defer(k, n)
-        return True
+    if store.full():
+        from .decode import snapshot_bytes
+
+        held = snapshot_bytes(snap)
+        if force:
+            if not store.may_force(held):
+                store.wait()                   # patch 0011: the copy past the cap would not fit: the writer first
+        elif store.may_defer(k, held):
+            if all(u is not snap for u in engine.unsaved):
+                engine.unsaved.append(snap)
+            store.defer(k, n, held)
+            return True
+        else:
+            store.wait()                       # patch 0011: no room to keep one more: the engine waits for the writer
     cp = store.copier
     sp = specs(engine.e.st, n, m)
     src = snap.rows if snap.rows is not None else [t[:c] for t, c, _, _ in sp]
@@ -99,7 +110,7 @@ def capture(engine, snap, *, force: bool = False) -> bool:
              "rec": cp.host(snap.rec, private=True), "conv": cp.host(snap.conv, private=True),
              "pending": cp.host(snap.pending, private=True) if snap.pending is not None else None}
     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),
-              ready=cp.done(), forced=force and store.full())
+              ready=cp.done(), forced=store.full())
     return True
 
 
@@ -123,7 +134,7 @@ def retry(engine, *, force: bool = False, only=None) -> None:
         save(engine, snap, force=force or urgent)
         k = engine.store.prefix(snap.ids).point(len(snap.ids))
         if all(x is not snap for x in engine.unsaved):
-            engine.store.deferred.pop(k, None)
+            engine.store.undefer(k)
 
 
 def restore(engine, prompt: list[int], have: int):

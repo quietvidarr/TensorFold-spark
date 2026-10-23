@@ -149,6 +149,26 @@ def test_full_queue_waits_in_gpu_never_drops(env, monkeypatch):
     assert not full.unsaved and full.store.stats["forced"] == 1
 
 
+def test_waiting_states_stay_within_their_cap(env, monkeypatch):
+    """Patch 0011: with a slow writer the states waiting in GPU memory stay within TF_PROMPT_CACHE_DEFER_GIB; past
+    it the step waits for the writer. Every state is saved."""
+    monkeypatch.setenv("TF_PROMPT_CACHE_QUEUE_GIB", "1e-9")
+    w = _weights()
+    a = _Dec(w)
+    s = a.store
+    put = s.tier.put
+    monkeypatch.setattr(s.tier, "put", lambda rel, obj: time.sleep(0.03) or put(rel, obj))
+    states = [_state(w, 1100 + 300 * j, j) for j in range(6)]
+    s.defer_cap = int(disk_points.held_bytes(*states[0]) * 1.5)        # room for one
+    for j, (state, snap) in enumerate(states):
+        a.add(list(range(7 * j, 7 * j + 1100 + 300 * j)), state, snap)
+        assert sum(s.defer_bytes.values()) <= s.defer_cap and len(a.unsaved) <= 1 and len(s.inflight) <= 1
+    assert s.stats["waits"] > 0
+    disk_points.retry(a, force=True)
+    _drain(s)
+    assert not a.unsaved and not s.defer_bytes and len(s.points) == 6 and s.stats["lost"] == 0
+
+
 def test_kept_ends_keep_shared_starts():
     """Over the cap: history states first, then conversations' newest; a reused system prompt's state stays."""
     import numpy as np

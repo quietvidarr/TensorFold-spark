@@ -18,11 +18,15 @@ class MemoryGate:
         self.room, self.reserve, self.held = int(room), int(reserve), 0
         self.live = live
         self.waits = self.ends = 0
+        self.outside: list[Callable[[], int]] = []      # patch 0011: memory held beside the caches (the prompt store)
+
+    def _held(self) -> int:
+        return self.held + sum(int(f()) for f in self.outside)
 
     def fits(self, extra: int) -> bool:
         """Whether ``extra`` more bytes can be allocated now (a resize holds its old buffers until the copy lands)."""
 
-        if self.held + int(extra) > self.room - self.reserve:
+        if self._held() + int(extra) > self.room - self.reserve:
             return False
         return self.live is None or self.live() >= int(extra) + self.reserve
 
