@@ -8,6 +8,7 @@ from typing import Any
 
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
 from tensorfold.server.request_options import effort_levels
+from tensorfold.server.template_override import announce, chat_template_override
 
 
 class ChatTemplate:
@@ -20,7 +21,10 @@ class ChatTemplate:
 
         cfg = json.loads((model_dir / "tokenizer_config.json").read_text())
         source_path = model_dir / "chat_template.jinja"
-        source = source_path.read_text() if source_path.exists() else cfg["chat_template"]
+        source = chat_template_override()                  # TF_CHAT_TEMPLATE wins over the checkpoint's
+        announce(source)
+        if source is None:
+            source = source_path.read_text() if source_path.exists() else cfg["chat_template"]
 
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)

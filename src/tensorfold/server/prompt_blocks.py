@@ -10,6 +10,7 @@ from typing import Any
 
 from tensorfold.server.checkpoints import longest_common_prefix
 from tensorfold.server.scheduler import ChatJob
+from tensorfold.server.sticky_reasoning import PREFIX
 from tensorfold.server.text import render_prompt_ids
 
 _REQUEST = threading.local()
@@ -25,13 +26,15 @@ class PromptBlocks:
         """Prompt ids plus the length of the rendered history that prefixes them."""
 
         thinking = self.enable_thinking if thinking is None else bool(thinking)
-        effort = self.effort_for((getattr(_REQUEST, "sampling", None) or {}).get("reasoning_effort"))
+        fields = getattr(_REQUEST, "sampling", None) or {}
+        effort = self.effort_for(fields.get("reasoning_effort"))
+        notes = fields.get("template_kwargs")             # sticky reasoning (server.sticky_reasoning)
         with self.tokenizer_lock:
             prompt = render_prompt_ids(self.tokenizer, messages, tools=tools, enable_thinking=thinking,
-                                       reasoning_effort=effort, late_system=self.late_system)
+                                       reasoning_effort=effort, late_system=self.late_system, template_kwargs=notes)
             history = render_prompt_ids(self.tokenizer, messages, tools=tools, enable_thinking=thinking,
                                         reasoning_effort=effort, add_generation_prompt=False,
-                                        late_system=self.late_system)
+                                        late_system=self.late_system, template_kwargs=notes)
         history_len = len(history) if 0 < len(history) < len(prompt) and prompt[: len(history)] == history else 0
         if not history_len and len(prompt) > 1 and history == prompt:
             # Gemma 4 after a tool result has no generation suffix, so the checkpoint sits one token short of the end.
@@ -44,7 +47,9 @@ class PromptBlocks:
     ) -> int:
         """A reusable system prefix, found with a probe in place of the first user message; zero for short matches."""
 
-        effort = self.effort_for((getattr(_REQUEST, "sampling", None) or {}).get("reasoning_effort"))
+        fields = getattr(_REQUEST, "sampling", None) or {}
+        effort = self.effort_for(fields.get("reasoning_effort"))
+        notes = {k: v for k, v in (fields.get("template_kwargs") or {}).items() if k == PREFIX}   # no tail: a probe
         first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), None)
         if first_user is None:
             return 0
@@ -54,7 +59,7 @@ class PromptBlocks:
                 other = render_prompt_ids(
                     self.tokenizer, probe, tools=tools,
                     enable_thinking=self.enable_thinking if thinking is None else bool(thinking),
-                    reasoning_effort=effort, late_system=self.late_system)
+                    reasoning_effort=effort, late_system=self.late_system, template_kwargs=notes)
         except Exception:  # noqa: BLE001 - a template quirk must not fail the request
             return 0
         shared = longest_common_prefix(prompt_ids, other)

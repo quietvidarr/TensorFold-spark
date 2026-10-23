@@ -17,6 +17,7 @@ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_co
 from tensorfold.server.decisions import DecisionError
 from tensorfold.server.errors import CapacityError, RequestError, error_body
 from tensorfold.server.request_options import parse_numbers, thinking_fields
+from tensorfold.server.sticky_reasoning import sticky_reasoning
 from tensorfold.server.probabilities import probability_options
 from tensorfold.server.messages import normalize_messages, validate_modalities
 from tensorfold.server.tool_policy import ToolCallPolicy
@@ -218,11 +219,14 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     with open(_REQUEST_LOG, "a") as handle:
                         handle.write(json.dumps(redact_images(body)) + "\n")
                 raw_kw: dict[str, Any] = {}
+                # sticky reasoning notes ride on the client's messages before normalization (sticky_reasoning)
+                sticky_messages, notes = sticky_reasoning(body.get("messages"), body.get("chat_template_kwargs"),
+                                                          getattr(app, "effort_levels", None))
                 if is_chat_completion:
-                    messages = normalize_messages(body.get("messages"), allow_images=getattr(app, "vision", None) is not None)
+                    messages = normalize_messages(sticky_messages, allow_images=getattr(app, "vision", None) is not None)
                     tools = active_tool_specs(body.get("tools"), body.get("tool_choice"))
                 elif isinstance(body.get("messages"), list) and body["messages"]:
-                    messages, tools = normalize_messages(body["messages"], allow_images=getattr(app, "vision", None) is not None), []
+                    messages, tools = normalize_messages(sticky_messages, allow_images=getattr(app, "vision", None) is not None), []
                 elif getattr(app, "accepts_raw_prompt", False):
                     # a text completion reads its prompt raw, as vLLM and mlx_lm do: no chat template, no think block
                     messages, tools = [], []
@@ -243,6 +247,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 if tools and tool_choice_requires_call(body.get("tool_choice")):
                     sampling_fields["tool_call_required"] = True     # the engine opens the answer with a call
                 sampling_fields.update(thinking_fields(body, getattr(app, "effort_levels", frozenset())))
+                if notes and messages:
+                    sampling_fields["template_kwargs"] = notes       # reasoning_prefix / reasoning_tail
                 sampling_kw = ({"sampling": sampling_fields}
                                if getattr(app, "accepts_sampling", False) else {})
                 if getattr(app, "accepts_cancellation", False):

@@ -12,6 +12,11 @@ OFF = 'chat_template_kwargs {"enable_thinking": false}'
 def template_thinks(model_dir: Path) -> bool:
     """Whether the checkpoint's chat template reads ``enable_thinking`` (its default decides a silent request)."""
 
+    from tensorfold.server.template_override import chat_template_override
+
+    override = chat_template_override()
+    if override is not None:
+        return "enable_thinking" in override
     template = Path(model_dir) / "chat_template.jinja"
     if template.is_file() and "enable_thinking" in template.read_text(errors="ignore"):
         return True

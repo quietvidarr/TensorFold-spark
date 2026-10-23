@@ -90,6 +90,7 @@ def prepare_prompt(app, messages, tools, thinking, prompt, fields):
             kwargs['tools'] = tools
         if thinking and effort:
             kwargs['reasoning_effort'] = effort
+        kwargs.update(fields.get('template_kwargs') or {})     # sticky reasoning: prefix/tail (notes on messages)
         with app.tokenizer_lock:
             return app.tokenizer.apply_chat_template(template, **kwargs)
 

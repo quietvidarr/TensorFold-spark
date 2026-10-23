@@ -106,8 +106,12 @@ def render_prompt_ids(
     add_generation_prompt: bool = True,
     reasoning_effort: str | None = None,
     late_system: str | None = None,
+    template_kwargs: dict[str, Any] | None = None,
 ) -> list[int]:
-    """Render chat tokens; Qwen3.8 thinking effort ``medium`` preserves the system block, while default ``xhigh`` adds an instruction."""
+    """Render chat tokens; Qwen3.8 thinking effort ``medium`` preserves the system block, while default ``xhigh`` adds an instruction.
+
+    ``template_kwargs``: further template kwargs, sticky reasoning's ``reasoning_prefix``/``reasoning_tail``
+    (``server.sticky_reasoning``; the messages already carry its notes)."""
 
     if late_system is None:
         late_system = template_late_system(tokenizer)
@@ -119,6 +123,8 @@ def render_prompt_ids(
     }
     if enable_thinking and reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
+    if template_kwargs:
+        kwargs.update(template_kwargs)
     if tools:
         kwargs["tools"] = tools
     try:

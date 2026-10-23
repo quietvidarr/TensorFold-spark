@@ -71,12 +71,15 @@ One commit per change on `spark`. Full diff: `git diff 609ca419 spark`.
 - Prompt store: pool sums by one join, scans near a cap
 - Prompt store: waiting points within TF_PROMPT_CACHE_DEFER_GIB
 - Qwen3.6: a step's points within the defer cap
+- Sticky reasoning notes (`chat_template_kwargs.reasoning_prefix`/`reasoning_changes`) and `TF_CHAT_TEMPLATE`
 
 ## Files changed
 `*` = added, others modified.
 
 - `src/tensorfold/cuda/exl3/`: experts.cpp, experts.cu, experts.py, experts_cb0.cu, experts_cb1.cu, experts_cb2.cu, experts_grouped.cuh, experts_prefill.cuh*, linear.cpp, linear.cu, linear.py, prefill.py, prompt_moe.cpp*, prompt_moe.cu*, prompt_moe.cuh*
-- `src/tensorfold/cuda/`: geometry.py, http.py, server.py, keep_rank.py*, markers.py, memory_gate.py, moe.py, prompt_store.py*, sampling.py
+- `src/tensorfold/server/`: app.py, http.py, prompt_blocks.py, prompts.py, sticky_reasoning.py*, template_override.py*, text.py, thinking_notes.py, token_routes.py
+- `src/tensorfold/families/`: tokenizer.py, glm5_next/prompts.py, glm5_next/cuda/app.py
+- `src/tensorfold/cuda/`: chat_template.py, geometry.py, http.py, server.py, keep_rank.py*, markers.py, memory_gate.py, moe.py, prompt_store.py*, sampling.py
 - `src/tensorfold/cuda/kernels/`: attention.py, gdn.py, gdn_prefill.cu
 - `src/tensorfold/`: cli.py, cli_args.py, engine/thinking_landing.py*
 - `src/tensorfold/families/glm5_next/`: __init__.py
@@ -90,4 +93,4 @@ One commit per change on `spark`. Full diff: `git diff 609ca419 spark`.
 - `tests/fixtures/`: c_on_arithmetic.json*, v50_c_seed1.json*, v50_c_seed2.json*
 - `serving/`*: sxuff's GLM serving files
 - `tools/`: glm_packed_audit_cpu.py*, glm_packed_eager.py*
-- `tests/`: test_answer_landing.py*, test_landing_integration.py*, test_landing_mtp.py*, test_noheader_landing.py*, test_thinking_landing.py*, test_exl3_ngram_pread.py*, test_flash_capacity_dispatch.py, test_flashnext_round_plan.py, test_flashnext_vision_prefix.py*, test_qwen36_kept_ends.py*, test_qwen36_prompt_store.py*
+- `tests/`: test_sticky_reasoning.py*, test_answer_landing.py*, test_landing_integration.py*, test_landing_mtp.py*, test_noheader_landing.py*, test_thinking_landing.py*, test_exl3_ngram_pread.py*, test_flash_capacity_dispatch.py, test_flashnext_round_plan.py, test_flashnext_vision_prefix.py*, test_qwen36_kept_ends.py*, test_qwen36_prompt_store.py*

@@ -7,6 +7,7 @@ from typing import Any, Callable
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
 from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
+from tensorfold.server.sticky_reasoning import active
 
 
 class ThinkingOffTemplate:
@@ -22,7 +23,7 @@ class ThinkingOffTemplate:
     def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
         extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
         text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
-        return text if enable_thinking else thinking_off(text)
+        return text if enable_thinking else thinking_off(text, sticky=active(messages, extra))
 
 
 class GlmApp(App):

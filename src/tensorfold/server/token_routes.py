@@ -14,6 +14,7 @@ from tensorfold.server.errors import RequestError
 from tensorfold.server.messages import normalize_messages
 from tensorfold.server.prompts import has_images, prepare_prompt
 from tensorfold.server.request_options import thinking_fields
+from tensorfold.server.sticky_reasoning import sticky_reasoning
 from tensorfold.server.text import render_prompt_ids
 from tensorfold.server.tools import active_tool_specs
 
@@ -66,12 +67,16 @@ def tokenize(app: Any, body: Any) -> dict[str, Any]:
     strings = flag(body, "return_token_strs", False)
     if "messages" in body:
         generation = flag(body, "add_generation_prompt", True)
-        messages = normalize_messages(body["messages"], allow_images=getattr(app, "vision", None) is not None)
+        sticky, notes = sticky_reasoning(body["messages"], body.get("chat_template_kwargs"),
+                                         getattr(app, "effort_levels", None))
+        messages = normalize_messages(sticky, allow_images=getattr(app, "vision", None) is not None)
         try:
             tools = active_tool_specs(body.get("tools"), body.get("tool_choice"))
         except ValueError as exc:
             raise RequestError(str(exc)) from None
         fields = thinking_fields(body, getattr(app, "effort_levels", frozenset()))
+        if notes:
+            fields["template_kwargs"] = notes
         requested = fields.get("enable_thinking")
         thinking = app.enable_thinking if requested is None else bool(requested)
         if has_images(messages):
@@ -82,7 +87,8 @@ def tokenize(app: Any, body: Any) -> dict[str, Any]:
             with app.tokenizer_lock:
                 ids = render_prompt_ids(app.tokenizer, messages, tools=tools, enable_thinking=thinking,
                                         reasoning_effort=app.effort_for(fields.get("reasoning_effort")),
-                                        add_generation_prompt=generation, late_system=app.late_system)
+                                        add_generation_prompt=generation, late_system=app.late_system,
+                                        template_kwargs=notes)
     else:
         text = body.get("prompt")
         if not isinstance(text, str):

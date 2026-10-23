@@ -106,7 +106,9 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
         self.served_name = served_name
         self.model_ids = served_model_ids(served_name, model_aliases)
         self.max_batch_size = int(lanes)
-        self.tokenizer = tokenizer
+        from tensorfold.families.tokenizer import with_template
+
+        self.tokenizer = tokenizer = with_template(tokenizer)       # TF_CHAT_TEMPLATE, before anything reads it
         self.tokenizer_lock = threading.Lock()
         self.default_max_tokens = int(default_max_tokens)
         # prompt + reply tokens a request may use (0: no limit)

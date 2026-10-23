@@ -23,6 +23,30 @@ def trimmed_config(model_dir: Path) -> Any | None:
     return AutoConfig.for_model(raw["model_type"], **{k: v for k, v in raw.items() if k != "model_type"})
 
 
+def with_template(tokenizer: Any) -> Any:
+    """``tokenizer`` with its chat template replaced by ``TF_CHAT_TEMPLATE``'s, when set (``ChatApp`` applies it to
+    every family's tokenizer before reading the template)."""
+
+    from tensorfold.server.template_override import announce, chat_template_override
+
+    source = chat_template_override()
+    if source is not None:
+        announce(source)
+        # wrappers (GlmTokenizer's _inner, mlx_lm's _tokenizer) render through the tokenizer they hold: set them all
+        seen, todo = set(), [tokenizer]
+        while todo:
+            target = todo.pop()
+            if target is None or id(target) in seen:
+                continue
+            seen.add(id(target))
+            todo += [target.__dict__.get(name) for name in ("_inner", "_tokenizer")] if hasattr(target, "__dict__") else []
+            try:
+                setattr(target, "chat_template", source)
+            except (AttributeError, TypeError):
+                pass
+    return tokenizer
+
+
 def load_tokenizer(model_dir: Path, eos_token_ids: Any = None) -> Any:
     """``mlx_lm.utils.load_tokenizer``, retried with ``trimmed_config`` when transformers refuses the layer lists."""
 

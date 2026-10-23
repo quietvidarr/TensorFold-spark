@@ -27,10 +27,15 @@ def clear_thinking() -> bool:
     return value == "1"
 
 
-def thinking_off(text: str) -> str:
-    """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
+def thinking_off(text: str, sticky: bool = False) -> str:
+    """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block.
 
-    text = text.replace(EFFORT_LINE, "", 1)
+    ``sticky`` (a render with sticky reasoning notes, ``server.sticky_reasoning``): the effort lines stay, since the
+    template wrote them for the conversation's levels and removing one would change earlier tokens; only the
+    generation prompt's think block closes."""
+
+    if not sticky:
+        text = text.replace(EFFORT_LINE, "", 1)
     return text + "</think>" if text.endswith(OPENED) else text
 
 
@@ -49,5 +54,8 @@ class GlmTokenizer:
         kwargs.setdefault("clear_thinking", self._clear)
         if kwargs.get("enable_thinking", True) is not False:
             return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
-        text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
+        from tensorfold.server.sticky_reasoning import active
+
+        text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs),
+                            sticky=active(messages, kwargs))
         return list(self._inner.encode(text, add_special_tokens=False)) if tokenize else text

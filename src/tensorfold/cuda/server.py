@@ -17,6 +17,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
+from tensorfold.server.sticky_reasoning import KWARGS as STICKY_KWARGS, sticky_reasoning
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
@@ -247,6 +248,11 @@ class App:
         effort = heard_effort(fields.get("reasoning_effort"), getattr(self, "reasoning_effort", None), levels)
         if thinking and effort:
             kwargs["reasoning_effort"] = effort
+        # reasoning_prefix / reasoning_changes: notes on the client's messages, before normalization moves any
+        messages, notes = sticky_reasoning(body.get("messages"), kwargs, levels) if chat else (None, {})
+        for key in STICKY_KWARGS:
+            kwargs.pop(key, None)
+        kwargs.update(notes)
         budget = parse_numbers({"thinking_budget": body.get("thinking_budget")})["thinking_budget"]
         budget = int(budget or getattr(self, "thinking_budget", 0)) if chat and thinking else 0     # 0: the default
         spec = grammar.request_spec(body)
@@ -259,7 +265,7 @@ class App:
                 self._probability_decoder = TokenBytes(self.tok)
         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
         if chat:
-            if not isinstance(body.get("messages"), list):
+            if not isinstance(messages, list):
                 raise RequestError("messages must be a list")
             from tensorfold.server.prompts import has_images, prepare_images
 
@@ -270,15 +276,15 @@ class App:
                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
 
-            if has_images(body["messages"]):
-                rendered = prepare_images(self.vision, body["messages"],
+            if has_images(messages):
+                rendered = prepare_images(self.vision, messages,
                                           lambda messages: render(messages, allow_images=True),
                                           context_limit=self._context_limit(),
                                           limits=getattr(self, "image_limits", DEFAULT_LIMITS))
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
-            text = render(body["messages"])
+            text = render(messages)
             prompt = self.tok.encode(text, add_special_tokens=False).ids
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
