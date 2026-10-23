@@ -68,12 +68,15 @@ One commit per change on `spark`. Full diff: `git diff 609ca419 spark`.
 - EXL3 prompt GEMM: K step 64
 - GLM: faster KDA step kernel
 - GLM: one-pass sparse latent attention for prompt chunks
+- Prompt store: pool sums by one join, scans near a cap
+- Prompt store: waiting points within TF_PROMPT_CACHE_DEFER_GIB
+- Qwen3.6: a step's points within the defer cap
 
 ## Files changed
 `*` = added, others modified.
 
 - `src/tensorfold/cuda/exl3/`: experts.cpp, experts.cu, experts.py, experts_cb0.cu, experts_cb1.cu, experts_cb2.cu, experts_grouped.cuh, experts_prefill.cuh*, linear.cpp, linear.cu, linear.py, prefill.py, prompt_moe.cpp*, prompt_moe.cu*, prompt_moe.cuh*
-- `src/tensorfold/cuda/`: geometry.py, http.py, server.py, keep_rank.py*, markers.py, moe.py, prompt_store.py*, sampling.py
+- `src/tensorfold/cuda/`: geometry.py, http.py, server.py, keep_rank.py*, markers.py, memory_gate.py, moe.py, prompt_store.py*, sampling.py
 - `src/tensorfold/cuda/kernels/`: attention.py, gdn.py, gdn_prefill.cu
 - `src/tensorfold/`: cli.py, cli_args.py, engine/thinking_landing.py*
 - `src/tensorfold/families/glm5_next/`: __init__.py
